@@ -1,0 +1,42 @@
+// Right-hand sides: a solver takes a vector or a matrix of columns and
+// gives back the same kind. The element type is a trait parameter, so
+// a solver's `T` comes from its matrix argument.
+
+use core::array::{Array, Matrix, Vector};
+
+/// A right-hand side `b` of `A x = b`: a vector or a list, or a matrix
+/// whose columns are separate right-hand sides. The answer has `b`'s
+/// kind.
+///
+/// ```nabi
+/// use core::array::{Array, Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[2, 0], [0, 4]];
+/// let v: Vector<f64> = [2, 4];
+/// let m: Matrix<f64> = [[2, 4], [4, 8]];
+/// assert(try linalg::solve(a, v) == Vector::<f64>::from([1.0, 1.0]));
+/// assert((try linalg::solve(a, m)).shape() == [2, 2]);
+/// let xs: List<f64> = [2, 4];
+/// assert(try linalg::solve(a, xs) == [1.0, 1.0]);
+/// ```
+pub trait Rhs<T> {
+    /// `self` as a matrix of columns.
+    fn matrix(self) -> Matrix<T>;
+    /// A solution matrix `x` in `self`'s kind.
+    fn like(self, x: Matrix<T>) -> Self;
+}
+
+impl<T> Rhs<T> for Vector<T> {
+    fn matrix(self) -> Matrix<T> { self[:, none] }
+    fn like(self, x: Matrix<T>) -> Vector<T> { x[:, 0] }
+}
+
+impl<T> Rhs<T> for Matrix<T> {
+    fn matrix(self) -> Matrix<T> { self }
+    fn like(self, x: Matrix<T>) -> Matrix<T> { x }
+}
+
+impl<T> Rhs<T> for List<T> {
+    fn matrix(self) -> Matrix<T> { Array::view_list(self, [self.len(), 1]) }
+    fn like(self, x: Matrix<T>) -> List<T> { x[:, 0].to_list() }
+}

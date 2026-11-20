@@ -1,0 +1,115 @@
+// The working form of a matrix: a row-major GC buffer the kernels index
+// without bounds checks. Public functions copy their `Array` arguments
+// in (O(mn), so views and strides never reach a kernel; the kernels
+// work in place) and copy the results out once into a list the result
+// array shares.
+
+use pkg::Scalar;
+use bare::mem::GcBuf;
+use core::array::{Array, Matrix, Vector};
+
+/// An `r` x `c` row-major matrix; element `(i, j)` is `d[i * c + j]`.
+pub(pkg) struct Mat<T> {
+    pub(pkg) d: GcBuf<T>;
+    pub(pkg) r: usize;
+    pub(pkg) c: usize;
+}
+
+impl<T> Mat<T> {
+    /// All zeros.
+    pub(pkg) fn zeros(r: usize, c: usize) -> Mat<T> {
+        // Zero bits are 0 for every `Scalar`; one spare slot keeps an
+        // empty buffer valid.
+        Mat { d: unsafe { GcBuf::new(r * c + 1) }, r: r, c: c }
+    }
+
+    /// A contiguous copy of `a`, in row-major order (views included).
+    pub(pkg) fn of(a: Matrix<T>) -> Mat<T> {
+        let s = a.shape();
+        let m: Mat<T> = Mat::zeros(s[0], s[1]);
+        let k = 0usize;
+        for x in a {
+            unsafe { m.d.set(k, x); }
+            k += 1;
+        }
+        m
+    }
+
+    /// `v` as one column.
+    pub(pkg) fn col(v: Vector<T>) -> Mat<T> {
+        let m: Mat<T> = Mat::zeros(v.len(), 1);
+        let i = 0usize;
+        unsafe {
+            for x in v { m.d.set(i, x); i += 1; }
+        }
+        m
+    }
+
+    pub(pkg) fn at(self, i: usize, j: usize) -> T { unsafe { self.d.get(i * self.c + j) } }
+
+    pub(pkg) fn put(self, i: usize, j: usize, v: T) { unsafe { self.d.set(i * self.c + j, v); } }
+
+    pub(pkg) fn copy(self) -> Mat<T> {
+        let m: Mat<T> = Mat::zeros(self.r, self.c);
+        unsafe {
+            for i in 0..self.r * self.c { m.d.set(i, self.d.get(i)); }
+        }
+        m
+    }
+
+    /// Rows `r0..r1`, columns `c0..c1`, as a copy.
+    pub(pkg) fn sub(self, r0: usize, r1: usize, c0: usize, c1: usize) -> Mat<T> {
+        let m: Mat<T> = Mat::zeros(r1 - r0, c1 - c0);
+        for i in r0..r1 {
+            for j in c0..c1 { m.put(i - r0, j - c0, self.at(i, j)); }
+        }
+        m
+    }
+
+    pub(pkg) fn array(self) -> Matrix<T> { Array::view_list(list(self.d, self.r * self.c), [self.r, self.c]) }
+}
+
+impl<T: Scalar> Mat<T> {
+    pub(pkg) fn eye(n: usize) -> Mat<T> {
+        let m: Mat<T> = Mat::zeros(n, n);
+        for i in 0..n { m.put(i, i, T::one()); }
+        m
+    }
+
+    /// The transpose, conjugated when `conj` (the adjoint), as a copy.
+    pub(pkg) fn t(self, conj: bool) -> Mat<T> {
+        let m: Mat<T> = Mat::zeros(self.c, self.r);
+        for i in 0..self.r {
+            for j in 0..self.c {
+                let x = self.at(i, j);
+                m.put(j, i, if conj { x.conj() } else { x });
+            }
+        }
+        m
+    }
+
+    /// `true` when every element is finite.
+    pub(pkg) fn finite(self) -> bool {
+        unsafe {
+            for i in 0..self.r * self.c {
+                if !self.d.get(i).finite() { return false; }
+            }
+        }
+        true
+    }
+}
+
+/// The first `n` elements of `d` as a list.
+fn list<T>(d: GcBuf<T>, n: usize) -> List<T> {
+    let xs: List<T> = List::with_capacity(n);
+    unsafe {
+        for i in 0..n { xs.push(d.get(i)); }
+    }
+    xs
+}
+
+/// A vector from the first `n` elements of `d`.
+pub(pkg) fn vector<T>(d: GcBuf<T>, n: usize) -> Vector<T> { Array::view_list(list(d, n), [n]) }
+
+/// A fresh buffer of `n` zeros (one spare slot keeps `n = 0` valid).
+pub(pkg) fn buf<T>(n: usize) -> GcBuf<T> { unsafe { GcBuf::new(n + 1) } }

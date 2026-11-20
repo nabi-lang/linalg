@@ -1,0 +1,73 @@
+use pkg::tests::suite::{EPS, cfro, close, crand, expect, fro, orth, rand, throws_kind, units};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+/// `a` with its columns in `perm` order.
+fn cols(a: Matrix<f64>, perm: List<usize>) -> Matrix<f64> {
+    Array::from_fn(a.shape(), |ix: [usize; 2]| -> f64 { a[ix[0], perm[ix[1]]] })
+}
+
+#[test]
+fn exact() {
+    let a: Matrix<f64> = [[3, 0], [4, 5]];
+    let f = try! pkg::qr(a);
+    let r = f.r();
+    close(r[0, 0].abs(), 5.0, 1e-15, "r00");
+    close(r[0, 1].abs(), 4.0, 1e-15, "r01");
+    close(r[1, 1].abs(), 3.0, 1e-15, "r11");
+}
+
+#[test]
+fn reconstruction() {
+    for (m, n) in [(1usize, 1usize), (5, 5), (40, 12), (12, 40), (90, 90), (200, 30)] {
+        let a = rand(m, n, (m + 7 * n) as u64);
+        let f = try! pkg::qr(a);
+        let q = f.q();
+        let r = f.r();
+        let k = m.min(n);
+        expect(q.shape() == [m, k] && r.shape() == [k, n], "thin shapes");
+        let res = units(a, try! pkg::matmul(q, r), m.max(n));
+        expect(res < 4.0, f"||A - QR|| = {res} at {m} x {n}");
+        expect(orth(q) < 4.0, f"||Q^T Q - I|| = {orth(q)} at {m} x {n}");
+        let qf = f.q_full();
+        expect(qf.shape() == [m, m] && orth(qf) < 4.0, "full Q");
+        for i in 0..k {
+            for j in 0..i { expect(r[i, j] == 0.0, "R upper"); }
+        }
+        let p = try! pkg::qr_pivoted(a);
+        let ap = cols(a, p.perm());
+        let res = units(ap, try! pkg::matmul(p.q(), p.r()), m.max(n));
+        expect(res < 4.0, f"||AP - QR|| = {res}");
+        let pr = p.r();
+        for i in 1..k { expect(pr[i, i].abs() <= pr[i - 1, i - 1].abs() * (1.0 + 1e-12), "pivoted |R_ii| falls"); }
+    }
+}
+
+#[test]
+fn complex_qr() {
+    let z = crand(9, 6, 4);
+    let f = try! pkg::qr(z);
+    let q = f.q();
+    let res = cfro(z .- try! pkg::matmul(q, f.r())) / (cfro(z) * 9.0 * EPS);
+    expect(res < 4.0, f"complex QR residual {res}");
+    let g = try! pkg::matmul(pkg::adjoint(q), q);
+    expect(cfro(g .- pkg::eye::<Complex<f64>>(6)) < 1e-14, "Q^H Q = I");
+}
+
+#[test]
+fn solve_and_errors() {
+    let a = rand(30, 8, 3);
+    let xs: Vector<f64> = Array::from_fn([8], |i: [usize; 1]| -> f64 { i[0] as f64 - 3.5 });
+    let b = try! pkg::matvec(a, xs);
+    let x = try! (try! pkg::qr(a)).solve(b);
+    for i in 0usize..8 { close(x[i], xs[i], 1e-12, "consistent system"); }
+    let wide = rand(3, 5, 1);
+    expect(throws_kind(|| { _ = try (try pkg::qr(wide)).solve(Vector::<f64>::from([1.0, 2.0, 3.0])); }, "ShapeMismatch"), "underdetermined");
+    let sing: Matrix<f64> = [[1, 0], [1, 0], [1, 0]];
+    expect(throws_kind(|| { _ = try (try pkg::qr(sing)).solve(Vector::<f64>::from([1.0, 2.0, 3.0])); }, "Singular"), "rank 1");
+    let nan: Matrix<f64> = [[f64::NAN, 1]];
+    expect(throws_kind(|| { _ = try pkg::qr(nan); }, "NotFinite"), "nan");
+    let zero: Matrix<f64> = Array::zeros([3, 2]);
+    let f = try! pkg::qr(zero);
+    expect(fro(f.r()) == 0.0 && orth(f.q()) < 1.0, "zero matrix");
+}

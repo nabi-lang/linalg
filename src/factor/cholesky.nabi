@@ -1,0 +1,172 @@
+//! Cholesky (A = L L^H) and the square-root-free LDL^H, both row by row
+//! (left-looking: each entry is one inner product of rows already done),
+//! reading only the lower triangle. Cholesky is backward stable for any
+//! positive definite matrix; O(n^3/3).
+
+use pkg::blas::{cdot, trsm};
+use pkg::dense::Mat;
+use pkg::error::square;
+use pkg::scalar::zero;
+use pkg::{LinalgError, Rhs, Scalar};
+use core::array::{Array, Matrix, Vector};
+
+/// `A = L L^H` of a Hermitian (real: symmetric) positive definite
+/// matrix, `L` lower triangular with a positive diagonal. Only the lower
+/// triangle of `A` is read.
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[4, 2], [2, 5]];
+/// let c = try linalg::cholesky(a);
+/// assert(c.l()[1, 0] == 1.0 && c.l()[1, 1] == 2.0);
+/// let b: Vector<f64> = [6, 7];
+/// assert(try c.solve(b) == Vector::<f64>::from([1.0, 1.0]));
+/// ```
+pub struct Cholesky<T> {
+    pub(pkg) l: Mat<T>;
+}
+
+/// `A = L D L^H` without pivoting: `L` unit lower triangular, `D` real
+/// diagonal. Needs nonzero leading minors (true for positive definite
+/// and quasi-definite matrices); for a general symmetric indefinite
+/// matrix use `lu`, which pivots. Only the lower triangle is read.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[4, 2], [2, -1]];
+/// let f = try linalg::ldlt(a);
+/// assert(f.d()[0] == 4.0 && f.d()[1] == -2.0);
+/// ```
+pub struct Ldlt<T> {
+    pub(pkg) f: Mat<T>;
+}
+
+pub(pkg) fn cholesky<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Cholesky<T> {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let n = s[0];
+    let x: Mat<T> = Mat::of(a);
+    if !x.finite() { throw LinalgError::NotFinite; }
+    let l: Mat<T> = Mat::zeros(n, n);
+    for j in 0..n {
+        let d = x.at(j, j).re() - cdot(l.d, j * n, l.d, j * n, j).re();
+        if !(d > zero::<T::Real>()) { throw LinalgError::NotPositiveDefinite { minor: j + 1 }; }
+        let ljj = d.sqrt();
+        l.put(j, j, T::from_real(ljj));
+        let inv = T::from_real(ljj).conj();
+        for i in j + 1..n {
+            // L[i, j] = (A[i, j] - sum_k L[i, k] conj(L[j, k])) / L[j, j]
+            let v = (x.at(i, j) - cdot(l.d, j * n, l.d, i * n, j)) / inv;
+            l.put(i, j, v);
+        }
+    }
+    Cholesky { l: l }
+}
+
+impl<T: Scalar> Cholesky<T> {
+    /// The lower factor `L`.
+    pub fn l(self) -> Matrix<T> { self.l.array() }
+
+    /// `x` with `A x = b`.
+    pub fn solve<B: Rhs<T>>(self, b: B) throws (LinalgError) -> B {
+        let x = try self.solve_mat(Mat::of(b.matrix()));
+        b.like(x.array())
+    }
+
+    pub(pkg) fn solve_mat(self, b: Mat<T>) throws (LinalgError) -> Mat<T> {
+        let n = self.l.r;
+        if b.r != n { throw pkg::error::mismatch("cholesky solve", f"{n} x {n}", f"{b.r} rows", "b needs one row per row of A"); }
+        let x = b.copy();
+        trsm(self.l, x, true, false, false);
+        trsm(self.l, x, true, true, false);
+        x
+    }
+
+    /// `A^-1`.
+    pub fn inv(self) throws (LinalgError) -> Matrix<T> { (try self.solve_mat(Mat::eye(self.l.r))).array() }
+
+    /// `det(A)`, the squared product of `L`'s diagonal.
+    pub fn det(self) -> T {
+        let d = T::one();
+        for i in 0..self.l.r {
+            let x = self.l.at(i, i);
+            d = d * x * x;
+        }
+        d
+    }
+
+    /// `ln det(A)`, without the overflow of `det` for large matrices.
+    pub fn logdet(self) -> T::Real {
+        let s = zero::<T::Real>();
+        for i in 0..self.l.r { s = s + self.l.at(i, i).re().ln(); }
+        s + s
+    }
+}
+
+pub(pkg) fn ldlt<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Ldlt<T> {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let n = s[0];
+    let x: Mat<T> = Mat::of(a);
+    if !x.finite() { throw LinalgError::NotFinite; }
+    let f: Mat<T> = Mat::zeros(n, n);
+    // w[k] = L[j, k] d[k], the row being finished scaled by D.
+    let w: Mat<T> = Mat::zeros(1, n);
+    for j in 0..n {
+        for k in 0..j { w.put(0, k, f.at(j, k).conj() * f.at(k, k)); }
+        let d = x.at(j, j).re() - dotw(w, f, j, j).re();
+        if d == zero::<T::Real>() { throw LinalgError::Singular { pivot: j }; }
+        f.put(j, j, T::from_real(d));
+        for i in j + 1..n {
+            let v = (x.at(i, j) - dotw(w, f, i, j)) / T::from_real(d);
+            f.put(i, j, v);
+        }
+    }
+    Ldlt { f: f }
+}
+
+/// `sum_k L[i, k] w[k]` over `k < j`.
+fn dotw<T: Scalar>(w: Mat<T>, f: Mat<T>, i: usize, j: usize) -> T {
+    let s = T::zero();
+    for k in 0..j { s = s + f.at(i, k) * w.at(0, k); }
+    s
+}
+
+impl<T: Scalar> Ldlt<T> {
+    /// The unit lower factor `L`.
+    pub fn l(self) -> Matrix<T> {
+        let f = self.f;
+        Array::from_fn([f.r, f.r], |ix: [usize; 2]| -> T {
+            if ix[0] == ix[1] { T::one() } else if ix[0] > ix[1] { f.at(ix[0], ix[1]) } else { T::zero() }
+        })
+    }
+
+    /// The diagonal of `D`.
+    pub fn d(self) -> Vector<T::Real> {
+        let f = self.f;
+        Array::from_fn([f.r], |ix: [usize; 1]| -> T::Real { f.at(ix[0], ix[0]).re() })
+    }
+
+    /// `x` with `A x = b`.
+    pub fn solve<B: Rhs<T>>(self, b: B) throws (LinalgError) -> B {
+        let n = self.f.r;
+        let x: Mat<T> = Mat::of(b.matrix());
+        if x.r != n { throw pkg::error::mismatch("ldlt solve", f"{n} x {n}", f"{x.r} rows", "b needs one row per row of A"); }
+        trsm(self.f, x, true, false, true);
+        for i in 0..n {
+            let d = self.f.at(i, i);
+            for j in 0..x.c { x.put(i, j, x.at(i, j) / d); }
+        }
+        trsm(self.f, x, true, true, true);
+        b.like(x.array())
+    }
+
+    /// `det(A)`, the product of `D`.
+    pub fn det(self) -> T {
+        let d = T::one();
+        for i in 0..self.f.r { d = d * self.f.at(i, i); }
+        d
+    }
+}

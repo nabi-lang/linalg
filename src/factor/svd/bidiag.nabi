@@ -1,0 +1,342 @@
+//! Golub-Kahan SVD: Householder bidiagonalization A = Q B P^T (B upper
+//! bidiagonal), then implicit-shift QR on B (Golub and Kahan, with
+//! Demmel and Kahan's zero-diagonal chase and a Wilkinson shift), the
+//! rotations accumulated into X^T and Y^T with B = X S Y^T. Backward
+//! stable: the singular values come out to about eps * ||A|| absolute.
+//! O(4mn^2 - 4n^3/3) for B, O(n^2) for the values alone, about 12n^3
+//! more for X and Y.
+
+use pkg::LinalgError;
+use pkg::Real;
+use pkg::blas::dot;
+use pkg::dense::{Mat, buf};
+use pkg::factor::qr::{apply_to, nrm2, reflect};
+use pkg::scalar::{eps, one, real, zero};
+use bare::mem::GcBuf;
+
+// From this many elements in a trailing update or a sweep of
+// rotations, column (row) blocks go to the workers.
+const PAR: usize = 65536;
+// Block width for the workers: columns of an update or a sweep.
+const CB: usize = 64;
+// Rows of a right update per worker block.
+const RB: usize = 16;
+
+/// `A = Q B P^T`: the left reflectors sit below the diagonal of `f`
+/// (scales `tl`) and the right ones right of the superdiagonal (scales
+/// `tr`); `d` is the diagonal of B, `e` its superdiagonal.
+pub(pkg) struct Bidiag<T> {
+    pub(pkg) f: Mat<T>;
+    pub(pkg) tl: GcBuf<T>;
+    pub(pkg) tr: GcBuf<T>;
+    pub(pkg) d: GcBuf<T>;
+    pub(pkg) e: GcBuf<T>;
+}
+
+/// Bidiagonalize `f` (m x n, m >= n) in place.
+pub(pkg) fn bidiagonalize<T: Real>(f: Mat<T>) -> Bidiag<T> {
+    let (m, n) = (f.r, f.c);
+    let tl: GcBuf<T> = buf(n);
+    let tr: GcBuf<T> = buf(n);
+    let d: GcBuf<T> = buf(n);
+    let e: GcBuf<T> = buf(n);
+    let w: GcBuf<T> = buf(n);
+    for k in 0..n {
+        let t = reflect(f, k, k);
+        unsafe {
+            tl.set(k, t);
+            d.set(k, f.at(k, k));
+        }
+        let big = (m - k) * (n - k) >= PAR;
+        if t != zero::<T>() {
+            if big {
+                par::for_each(blocks(k + 1, n, CB), |j0: usize| { apply_to(f, k, k, t, f, j0, n.min(j0 + CB), w); });
+            } else {
+                apply_to(f, k, k, t, f, k + 1, n, w);
+            }
+        }
+        if k + 1 < n {
+            let t = reflect_row(f, k, k + 1);
+            unsafe {
+                tr.set(k, t);
+                e.set(k, f.at(k, k + 1));
+            }
+            if t != zero::<T>() {
+                if big {
+                    par::for_each(blocks(k + 1, m, RB), |r0: usize| { apply_right(f, k, k + 1, t, f, r0, m.min(r0 + RB)); });
+                } else {
+                    apply_right(f, k, k + 1, t, f, k + 1, m);
+                }
+            }
+        }
+    }
+    Bidiag { f: f, tl: tl, tr: tr, d: d, e: e }
+}
+
+/// The reflector of row `row` from column `col` on: `v` (v[col] = 1
+/// implied) stored to the right, beta on `(row, col)`; returns tau.
+pub(pkg) fn reflect_row<T: Real>(f: Mat<T>, row: usize, col: usize) -> T {
+    let n = f.c;
+    let o = row * n;
+    let alpha = f.at(row, col);
+    let xn = norm(f.d, o + col + 1, n - col - 1);
+    if xn == zero::<T>() { return zero::<T>(); }
+    let mag = alpha.hypot(xn);
+    let beta = if alpha >= zero::<T>() { -mag } else { mag };
+    let tau = (beta - alpha) / beta;
+    let s = one::<T>() / (alpha - beta);
+    unsafe {
+        for j in col + 1..n { f.d.set(o + j, f.d.get(o + j) * s); }
+    }
+    f.put(row, col, beta);
+    tau
+}
+
+/// The 2-norm of `d[o..o + n]`: a plain sum of squares (four partial
+/// sums), the scaled `nrm2` only when that sum could have overflowed
+/// or lost terms to underflow.
+pub(pkg) fn norm<T: Real>(d: GcBuf<T>, o: usize, n: usize) -> T {
+    let s = dot(d, o, d, o, n);
+    if s.is_finite() && s >= real::<T>(1e-20) { return s.sqrt(); }
+    nrm2(d, o, 1, n)
+}
+
+/// Rows `r0..r1` of `x` times `I - t v v^T`, `v` the reflector in row
+/// `row` of `f` from column `col` (x.c == f.c).
+pub(pkg) fn apply_right<T: Real>(f: Mat<T>, row: usize, col: usize, t: T, x: Mat<T>, r0: usize, r1: usize) {
+    let n = f.c;
+    let vo = row * n;
+    unsafe {
+        for i in r0..r1 {
+            let o = i * n;
+            let h = x.d.get(o + col) + dot(f.d, vo + col + 1, x.d, o + col + 1, n - col - 1);
+            let th = t * h;
+            x.d.set(o + col, x.d.get(o + col) - th);
+            for j in col + 1..n { x.d.set(o + j, x.d.get(o + j) - th * f.d.get(vo + j)); }
+        }
+    }
+}
+
+/// The starts of the blocks of `w` from `a` up to `b`.
+pub(pkg) fn blocks(a: usize, b: usize, w: usize) -> List<usize> {
+    let xs: List<usize> = List::with_capacity((b - a) / w + 1);
+    let i = a;
+    while i < b {
+        xs.push(i);
+        i += w;
+    }
+    xs
+}
+
+/// The rotations of rows k, k+1 by `(c[k], s[k])` (as `rot`), k from
+/// `lo` up to `hi`, on columns `j0..j1` of `x`: each element is loaded
+/// and stored once per sweep.
+fn sweep<T: Real>(x: Mat<T>, lo: usize, hi: usize, c: GcBuf<T>, s: GcBuf<T>, j0: usize, j1: usize) {
+    let n = x.c;
+    unsafe {
+        for k in lo..hi {
+            let (ck, sk) = (c.get(k), s.get(k));
+            let op = k * n;
+            let oq = op + n;
+            for j in j0..j1 {
+                let xp = x.d.get(op + j);
+                let xq = x.d.get(oq + j);
+                x.d.set(op + j, ck * xp + sk * xq);
+                x.d.set(oq + j, ck * xq - sk * xp);
+            }
+        }
+    }
+}
+
+/// One QR step's sweeps on `yt` (right) and `xt` (left), in column
+/// blocks on the workers when large.
+fn sweeps<T: Real>(xt: Mat<T>, yt: Mat<T>, lo: usize, hi: usize, rc: GcBuf<T>, rs: GcBuf<T>, lc: GcBuf<T>, ls: GcBuf<T>) {
+    let n = yt.c;
+    if (hi - lo) * n < PAR || n < 2 * CB {
+        sweep(yt, lo, hi, rc, rs, 0, n);
+        sweep(xt, lo, hi, lc, ls, 0, n);
+        return;
+    }
+    // Blocks of yt, then those of xt offset by n.
+    let tasks = blocks(0, n, CB);
+    for j0 in blocks(0, n, CB) { tasks.push(n + j0); }
+    par::for_each(tasks, |t: usize| {
+        if t < n {
+            sweep(yt, lo, hi, rc, rs, t, n.min(t + CB));
+        } else {
+            sweep(xt, lo, hi, lc, ls, t - n, n.min(t - n + CB));
+        }
+    });
+}
+
+/// `(c, s, r)` with `[c s; -s c] [f; g] = [r; 0]`.
+fn givens<T: Real>(f: T, g: T) -> (T, T, T) {
+    if g == zero::<T>() { return (one::<T>(), zero::<T>(), f); }
+    if f == zero::<T>() { return (zero::<T>(), one::<T>(), g); }
+    let r = f.hypot(g);
+    (f / r, g / r, r)
+}
+
+/// Rows `p`, `q` of `x` become `c x_p + s x_q`, `c x_q - s x_p`.
+fn rot<T: Real>(x: Mat<T>, p: usize, q: usize, c: T, s: T) {
+    let n = x.c;
+    let (op, oq) = (p * n, q * n);
+    unsafe {
+        for j in 0..n {
+            let xp = x.d.get(op + j);
+            let xq = x.d.get(oq + j);
+            x.d.set(op + j, c * xp + s * xq);
+            x.d.set(oq + j, c * xq - s * xp);
+        }
+    }
+}
+
+/// The SVD of the n x n bidiagonal (`d`, `e`) in place: `d` becomes the
+/// singular values (non-negative, unsorted). With `vectors`, the left
+/// rotations go into the rows of `xt` and the right ones into the rows
+/// of `yt` (both n rows), so B = X S Y^T from X = Y = I.
+pub(pkg) fn bdsqr<T: Real>(d: GcBuf<T>, e: GcBuf<T>, n: usize, xt: Mat<T>, yt: Mat<T>, vectors: bool) throws (LinalgError) {
+    if n == 0 { return; }
+    // Scaled to a largest entry of 1, so the shift's squares cannot
+    // overflow and `ep` is the absolute threshold eps * ||B||.
+    let big = zero::<T>();
+    unsafe {
+        for i in 0..n {
+            big = big.max(d.get(i).abs());
+            if i + 1 < n { big = big.max(e.get(i).abs()); }
+        }
+        if big == zero::<T>() { return; }
+        for i in 0..n {
+            d.set(i, d.get(i) / big);
+            if i + 1 < n { e.set(i, e.get(i) / big); }
+        }
+    }
+    // One step's rotations, applied to the vectors after the step.
+    let rc: GcBuf<T> = buf(n);
+    let rs: GcBuf<T> = buf(n);
+    let lc: GcBuf<T> = buf(n);
+    let ls: GcBuf<T> = buf(n);
+    let ep = eps::<T>();
+    let half = real::<T>(0.5);
+    let maxit = 6 * n * n;
+    let it = 0usize;
+    let hi = n - 1;
+    unsafe {
+        while hi > 0 {
+            // The unreduced block lo..=hi: e[lo..hi] all non-negligible.
+            let lo = hi;
+            while lo > 0 {
+                let x = e.get(lo - 1).abs();
+                if x <= ep * (d.get(lo - 1).abs() + d.get(lo).abs()) {
+                    e.set(lo - 1, zero::<T>());
+                    break;
+                }
+                lo -= 1;
+            }
+            if lo == hi {
+                hi -= 1;
+                continue;
+            }
+            let zi = n;
+            for i in lo..hi + 1 {
+                if d.get(i).abs() <= ep {
+                    zi = i;
+                    break;
+                }
+            }
+            if zi < n {
+                d.set(zi, zero::<T>());
+                if zi < hi {
+                    // Zero row zi with left rotations against rows
+                    // zi+1..=hi.
+                    let x = e.get(zi);
+                    e.set(zi, zero::<T>());
+                    for j in zi + 1..hi + 1 {
+                        let (c, s, r) = givens(d.get(j), x);
+                        d.set(j, r);
+                        if j < hi {
+                            x = -s * e.get(j);
+                            e.set(j, c * e.get(j));
+                        }
+                        if vectors { rot(xt, j, zi, c, s); }
+                    }
+                } else {
+                    // Zero column hi with right rotations against columns
+                    // hi-1 down to lo.
+                    let x = e.get(hi - 1);
+                    e.set(hi - 1, zero::<T>());
+                    let j = hi;
+                    while j > lo {
+                        j -= 1;
+                        let (c, s, r) = givens(d.get(j), x);
+                        d.set(j, r);
+                        if j > lo {
+                            x = -s * e.get(j - 1);
+                            e.set(j - 1, c * e.get(j - 1));
+                        }
+                        if vectors { rot(yt, j, hi, c, s); }
+                    }
+                }
+                continue;
+            }
+            it += hi - lo;
+            if it > maxit { throw LinalgError::NoConvergence { iterations: it }; }
+            // Wilkinson shift: the eigenvalue of the trailing 2 x 2 of
+            // B^T B nearer its last entry.
+            let dm = d.get(hi - 1);
+            let dn = d.get(hi);
+            let em = e.get(hi - 1);
+            let el = if hi - 1 > lo { e.get(hi - 2) } else { zero::<T>() };
+            let t11 = dm * dm + el * el;
+            let t12 = dm * em;
+            let t22 = dn * dn + em * em;
+            let dl = (t11 - t22) * half;
+            let den = dl + (if dl < zero::<T>() { -one::<T>() } else { one::<T>() }) * dl.hypot(t12);
+            let mu = if den == zero::<T>() { t22 } else { t22 - t12 * t12 / den };
+            let y = d.get(lo) * d.get(lo) - mu;
+            let z = d.get(lo) * e.get(lo);
+            for k in lo..hi {
+                // Right rotation on columns k, k+1: zero B[k-1, k+1]
+                // (the bulge) or start the chase.
+                let (c, s, r) = givens(y, z);
+                if k > lo { e.set(k - 1, r); }
+                let dk = d.get(k);
+                let ek = e.get(k);
+                let dk1 = d.get(k + 1);
+                d.set(k, c * dk + s * ek);
+                e.set(k, c * ek - s * dk);
+                let bulge = s * dk1;
+                d.set(k + 1, c * dk1);
+                rc.set(k, c);
+                rs.set(k, s);
+                // Left rotation on rows k, k+1: zero B[k+1, k].
+                let (c, s, r) = givens(d.get(k), bulge);
+                d.set(k, r);
+                let ek = e.get(k);
+                let dk1 = d.get(k + 1);
+                e.set(k, c * ek + s * dk1);
+                d.set(k + 1, c * dk1 - s * ek);
+                if k + 1 < hi {
+                    z = s * e.get(k + 1);
+                    e.set(k + 1, c * e.get(k + 1));
+                }
+                y = e.get(k);
+                lc.set(k, c);
+                ls.set(k, s);
+            }
+            if vectors { sweeps(xt, yt, lo, hi, rc, rs, lc, ls); }
+        }
+        for i in 0..n {
+            let x = d.get(i);
+            if x < zero::<T>() {
+                d.set(i, -x * big);
+                if vectors {
+                    let o = i * yt.c;
+                    for j in 0..yt.c { yt.d.set(o + j, -yt.d.get(o + j)); }
+                }
+            } else {
+                d.set(i, x * big);
+            }
+        }
+    }
+}

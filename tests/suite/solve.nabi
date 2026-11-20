@@ -1,0 +1,101 @@
+use pkg::Triangle;
+use pkg::tests::suite::{EPS, close, crand, expect, fro, rand, throws_kind};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+#[test]
+fn lstsq_fit() {
+    // y = 2 - 3t + 0.5 t^2 sampled exactly: the fit recovers it.
+    let t: Vector<f64> = Array::from_fn([20], |i: [usize; 1]| -> f64 { i[0] as f64 / 4.0 });
+    let a: Matrix<f64> = Array::from_fn([20, 3], |ix: [usize; 2]| -> f64 { t[ix[0]] ** (ix[1] as i32) });
+    let y = t.map(|x: f64| -> f64 { 2.0 - 3.0 * x + 0.5 * x * x });
+    let c = try! pkg::lstsq(a, y);
+    close(c[0], 2.0, 1e-12, "c0");
+    close(c[1], -3.0, 1e-12, "c1");
+    close(c[2], 0.5, 1e-12, "c2");
+    // Noisy data: the residual is orthogonal to the columns.
+    let noisy = y .+ rand(20, 1, 3)[:, 0] .* 0.1;
+    let c = try! pkg::lstsq(a, noisy);
+    let r = noisy .- try! pkg::matvec(a, c);
+    let g = try! pkg::vecmat(r, a);
+    for x in g { expect(x.abs() < 1e-12, "A^T r = 0"); }
+}
+
+#[test]
+fn lstsq_vandermonde() {
+    // Degree-9 fit on [0, 1] (cond about 1e7 even scaled): the
+    // documented tolerance is 1e-6 on coefficients of an exact
+    // polynomial (measured 1e-8).
+    let n = 30usize;
+    let a: Matrix<f64> = Array::from_fn([n, 10], |ix: [usize; 2]| -> f64 { (ix[0] as f64 / (n - 1) as f64) ** (ix[1] as i32) });
+    let want: Vector<f64> = [1, -2, 3, -4, 5, -6, 7, -8, 9, -10];
+    let y = try! pkg::matvec(a, want);
+    let c = try! pkg::lstsq(a, y);
+    for k in 0usize..10 { close(c[k], want[k], 1e-6, f"coefficient {k}"); }
+}
+
+#[test]
+fn lstsq_rank_deficient_and_wide() {
+    // Rank 2 with a repeated column: the answer is the minimum-norm one,
+    // which is what the pseudo-inverse gives.
+    let a: Matrix<f64> = [[1, 1, 0], [1, 1, 1], [1, 1, 2], [1, 1, 3]];
+    let b: Vector<f64> = [1, 2, 2, 4];
+    let x = try! pkg::lstsq(a, b);
+    let p = try! pkg::matvec(try! pkg::pinv(a), b);
+    for i in 0usize..3 { close(x[i], p[i], 1e-13, f"minimum norm {i}"); }
+    close(x[0], x[1], 1e-14, "the repeated columns share the weight");
+    // Underdetermined: x = A^T (A A^T)^-1 b.
+    let w = rand(3, 7, 5);
+    let b3: Vector<f64> = [1, -1, 2];
+    let x = try! pkg::lstsq(w, b3);
+    let back = try! pkg::matvec(w, x);
+    for i in 0usize..3 { close(back[i], b3[i], 1e-13, "consistent"); }
+    let p = try! pkg::matvec(try! pkg::pinv(w), b3);
+    for i in 0usize..7 { close(x[i], p[i], 1e-13, "minimum norm, wide"); }
+    // Several right-hand sides; zero matrix.
+    let bs = rand(4, 2, 6);
+    let xs = try! pkg::lstsq(a, bs);
+    expect(xs.shape() == [3, 2], "matrix rhs");
+    let z: Matrix<f64> = Array::zeros([4, 3]);
+    expect(try! pkg::lstsq(z, b) == Vector::<f64>::zeros([3]), "zero matrix");
+    expect(throws_kind(|| { _ = try pkg::lstsq(a, Vector::<f64>::from([1.0])); }, "ShapeMismatch"), "rows");
+    // Complex.
+    let c = crand(8, 3, 7);
+    let xc: Vector<Complex<f64>> = [1.0 + 1.0i, -2.0i, 0.5 + 0.0i];
+    let bc = try! pkg::matvec(c, xc);
+    let got = try! pkg::lstsq(c, bc);
+    for i in 0usize..3 { expect((got[i] - xc[i]).abs() < 1e-13, "complex lstsq"); }
+}
+
+#[test]
+fn triangular() {
+    let u: Matrix<f64> = [[2, 1, -1], [0, 3, 2], [0, 0, 4]];
+    let b: Vector<f64> = [3, 13, 8];
+    let x = try! pkg::solve_triangular(u, b, Triangle::Upper);
+    expect(x == Vector::<f64>::from([1.0, 3.0, 2.0]), f"upper {x:?}");
+    let l = u.t().copy();
+    let y = try! pkg::solve_triangular(l, Vector::<f64>::from([4.0, 5.0, 10.0]), Triangle::Lower);
+    expect(y == Vector::<f64>::from([2.0, 1.0, 2.5]), f"lower {y:?}");
+    // Only the named triangle is read.
+    let junk: Matrix<f64> = [[2, 0], [99, 4]];
+    let z = try! pkg::solve_triangular(junk, Vector::<f64>::from([2.0, 4.0]), Triangle::Upper);
+    expect(z == Vector::<f64>::from([1.0, 1.0]), "upper ignores the lower part");
+    let s: Matrix<f64> = [[1, 1], [0, 0]];
+    expect(throws_kind(|| { _ = try pkg::solve_triangular(s, Vector::<f64>::from([1.0, 1.0]), Triangle::Upper); }, "Singular"), "zero diagonal");
+}
+
+#[test]
+fn cond_rank_det() {
+    let a: Matrix<f64> = [[1, 0], [0, 1e-8]];
+    close(try! pkg::cond(a), 1e8, 1e-6, "cond");
+    expect(try! pkg::rank(a) == 2, "rank 2");
+    let b: Matrix<f64> = [[1, 0], [0, 1e-17]];
+    expect(try! pkg::rank(b) == 1, "rank below tolerance");
+    let r = rand(9, 9, 31);
+    let d = try! pkg::det(r);
+    let s = (try! pkg::svd(r)).s();
+    let prod = 1.0;
+    for x in s { prod *= x; }
+    close(d.abs(), prod, 1e-12 * prod, "|det| = prod s");
+    let _ = (EPS, fro(r));
+}

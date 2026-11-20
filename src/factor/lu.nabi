@@ -1,0 +1,185 @@
+//! LU with partial pivoting, blocked right-looking (LAPACK's xGETRF):
+//! a panel of NB columns is factored with row pivoting (largest |re| +
+//! |im| in the column), then the block row is solved and the trailing
+//! matrix updated by one `gemm`, where most of the flops go. Backward
+//! stable in practice (growth factor bound 2^(n-1), rarely above 10);
+//! O(2n^3/3).
+
+use pkg::blas::{axpy, gemm, trsm};
+use pkg::dense::Mat;
+use pkg::error::square;
+use pkg::{LinalgError, Rhs, Scalar};
+use core::array::{Array, Matrix};
+
+// Panel width.
+const NB: usize = 32;
+
+/// `P A = L U` of a square matrix: `L` unit lower, `U` upper, `P` a row
+/// permutation. Build it with `linalg::lu`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[4, 3], [6, 3]];
+/// let f = try linalg::lu(a);
+/// assert(f.perm() == [1, 0]);
+/// let x = try f.solve(core::array::Vector::<f64>::from([10.0, 12.0]));
+/// assert(x[0] == 1.0 && x[1] == 2.0);
+/// ```
+pub struct Lu<T> {
+    pub(pkg) f: Mat<T>;
+    /// Row `i` of `P A` is row `piv[i]` of `A`.
+    pub(pkg) piv: List<usize>;
+    pub(pkg) sign: i32;
+}
+
+/// Factor `a` (any square matrix: a zero pivot is kept and only `solve`
+/// / `inv` report it).
+pub(pkg) fn factor<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Lu<T> {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let f: Mat<T> = Mat::of(a);
+    if !f.finite() { throw LinalgError::NotFinite; }
+    let n = s[0];
+    let piv: List<usize> = List::with_capacity(n);
+    for i in 0..n { piv.push(i); }
+    let sign = 1i32;
+    let k0 = 0usize;
+    while k0 < n {
+        let kb = NB.min(n - k0);
+        let k1 = k0 + kb;
+        // Panel: columns k0..k1, rows swapped whole.
+        for k in k0..k1 {
+            let p = k;
+            let best = f.at(k, k).abs1();
+            for i in k + 1..n {
+                let v = f.at(i, k).abs1();
+                if v > best { best = v; p = i; }
+            }
+            if p != k {
+                unsafe {
+                    for j in 0..n {
+                        let t = f.d.get(k * n + j);
+                        f.d.set(k * n + j, f.d.get(p * n + j));
+                        f.d.set(p * n + j, t);
+                    }
+                }
+                let t = piv[k];
+                piv[k] = piv[p];
+                piv[p] = t;
+                sign = -sign;
+            }
+            let d = f.at(k, k);
+            if d == T::zero() { continue; }
+            for i in k + 1..n {
+                let l = f.at(i, k) / d;
+                f.put(i, k, l);
+                axpy(l, f.d, k * n + k + 1, f.d, i * n + k + 1, k1 - k - 1);
+            }
+        }
+        if k1 < n {
+            // U12 = L11^-1 A12, then A22 -= L21 U12 as one product.
+            for i in k0 + 1..k1 {
+                for p in k0..i { axpy(f.at(i, p), f.d, p * n + k1, f.d, i * n + k1, n - k1); }
+            }
+            let l21 = f.sub(k1, n, k0, k1);
+            let u12 = f.sub(k0, k1, k1, n);
+            let c = gemm(l21, u12);
+            let w = n - k1;
+            unsafe {
+                for i in 0..n - k1 {
+                    let o = (k1 + i) * n + k1;
+                    for j in 0..w { f.d.set(o + j, f.d.get(o + j) - c.d.get(i * w + j)); }
+                }
+            }
+        }
+        k0 = k1;
+    }
+    Lu { f: f, piv: piv, sign: sign }
+}
+
+impl<T: Scalar> Lu<T> {
+    /// The order `n`.
+    pub fn n(self) -> usize { self.f.r }
+
+    /// The unit lower factor `L`.
+    pub fn l(self) -> Matrix<T> {
+        let n = self.f.r;
+        let f = self.f;
+        Array::from_fn([n, n], |ix: [usize; 2]| -> T {
+            if ix[0] == ix[1] { T::one() } else if ix[0] > ix[1] { f.at(ix[0], ix[1]) } else { T::zero() }
+        })
+    }
+
+    /// The upper factor `U`.
+    pub fn u(self) -> Matrix<T> {
+        let n = self.f.r;
+        let f = self.f;
+        Array::from_fn([n, n], |ix: [usize; 2]| -> T { if ix[0] <= ix[1] { f.at(ix[0], ix[1]) } else { T::zero() } })
+    }
+
+    /// The row order: row `i` of `P A` is row `perm()[i]` of `A`.
+    pub fn perm(self) -> List<usize> { self.piv.clone() }
+
+    /// The permutation matrix `P` (`P A = L U`).
+    pub fn p(self) -> Matrix<T> {
+        let n = self.f.r;
+        let piv = self.piv;
+        Array::from_fn([n, n], |ix: [usize; 2]| -> T { if piv[ix[0]] == ix[1] { T::one() } else { T::zero() } })
+    }
+
+    /// `det(A)`: the product of `U`'s diagonal, signed by `P`.
+    pub fn det(self) -> T {
+        let d = if self.sign < 0 { -T::one() } else { T::one() };
+        for i in 0..self.f.r { d = d * self.f.at(i, i); }
+        d
+    }
+
+    /// `x` with `A x = b`; `b` is a vector or a matrix of columns.
+    /// Throws `Singular` for a zero pivot.
+    pub fn solve<B: Rhs<T>>(self, b: B) throws (LinalgError) -> B {
+        let m = try self.solve_mat(Mat::of(b.matrix()));
+        b.like(m.array())
+    }
+
+    /// `A^-1`. Throws `Singular` for a zero pivot.
+    pub fn inv(self) throws (LinalgError) -> Matrix<T> {
+        let m = try self.solve_mat(Mat::eye(self.f.r));
+        m.array()
+    }
+
+    /// `A^H x = b` (`A^T x = b` for a real matrix).
+    pub fn solve_adjoint<B: Rhs<T>>(self, b: B) throws (LinalgError) -> B {
+        let n = self.f.r;
+        let rhs: Mat<T> = Mat::of(b.matrix());
+        if rhs.r != n { throw pkg::error::mismatch("solve", f"{n} x {n}", f"{rhs.r} rows", "b needs one row per row of A"); }
+        try self.check();
+        // A^H = U^H L^H P: solve U^H y = b, L^H z = y, then x = P^T z.
+        trsm(self.f, rhs, false, true, false);
+        trsm(self.f, rhs, true, true, true);
+        let x: Mat<T> = Mat::zeros(n, rhs.c);
+        for i in 0..n {
+            for j in 0..rhs.c { x.put(self.piv[i], j, rhs.at(i, j)); }
+        }
+        b.like(x.array())
+    }
+
+    fn check(self) throws (LinalgError) {
+        for i in 0..self.f.r {
+            if self.f.at(i, i) == T::zero() { throw LinalgError::Singular { pivot: i }; }
+        }
+    }
+
+    pub(pkg) fn solve_mat(self, b: Mat<T>) throws (LinalgError) -> Mat<T> {
+        let n = self.f.r;
+        if b.r != n { throw pkg::error::mismatch("solve", f"{n} x {n}", f"{b.r} rows", "b needs one row per row of A"); }
+        try self.check();
+        let x: Mat<T> = Mat::zeros(n, b.c);
+        for i in 0..n {
+            for j in 0..b.c { x.put(i, j, b.at(self.piv[i], j)); }
+        }
+        trsm(self.f, x, true, false, true);
+        trsm(self.f, x, false, false, false);
+        x
+    }
+}

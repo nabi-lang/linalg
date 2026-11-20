@@ -1,0 +1,10 @@
+//! The factorizations, each a type with `solve` / `det` / `inv` where
+//! they make sense; build them with the functions at the package root
+//! (`linalg::lu(a)`, `linalg::svd(a)`, ...).
+
+pub mod cholesky;
+pub mod eig;
+pub mod eigh;
+pub mod lu;
+pub mod qr;
+pub mod svd;

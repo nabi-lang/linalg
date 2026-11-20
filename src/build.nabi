@@ -1,0 +1,96 @@
+// Building and reading matrices: identity, diagonals, trace, adjoint.
+
+use pkg::error::square;
+use pkg::{LinalgError, Scalar};
+use core::array::{Array, Matrix, Vector};
+
+/// The n x n identity.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let i: Matrix<f64> = linalg::eye(2);
+/// assert(i == Matrix::<f64>::from_list([1.0, 0.0, 0.0, 1.0], [2, 2]));
+/// ```
+pub fn eye<T: Scalar>(n: usize) -> Matrix<T> {
+    Array::from_fn([n, n], |ix: [usize; 2]| -> T { if ix[0] == ix[1] { T::one() } else { T::zero() } })
+}
+
+/// The square matrix with `v` on its diagonal.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let v: Vector<f64> = [1, 2];
+/// assert(linalg::diag(v)[1, 1] == 2.0);
+/// ```
+pub fn diag<T: Scalar>(v: Vector<T>) -> Matrix<T> {
+    let n = v.len();
+    let d = v.copy();
+    Array::from_fn([n, n], |ix: [usize; 2]| -> T { if ix[0] == ix[1] { d[ix[0]] } else { T::zero() } })
+}
+
+/// The diagonal `a[i, i]` of any matrix, as a copy.
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[1, 2, 3], [4, 5, 6]];
+/// assert(linalg::diagonal(a) == Vector::<f64>::from([1.0, 5.0]));
+/// ```
+pub fn diagonal<T: Scalar>(a: Matrix<T>) -> Vector<T> {
+    let s = a.shape();
+    Array::from_fn([s[0].min(s[1])], |ix: [usize; 1]| -> T { a[ix[0], ix[0]] })
+}
+
+/// The sum of the diagonal of a square matrix.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2], [3, 4]];
+/// assert(try linalg::trace(a) == 5.0);
+/// ```
+pub fn trace<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> T {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let t = T::zero();
+    for i in 0..s[0] { t = t + a[i, i]; }
+    t
+}
+
+/// The conjugate transpose `a^H`: a view (`a.t()`) for a real matrix,
+/// a conjugated copy for a complex one.
+///
+/// ```nabi
+/// use core::array::Matrix;
+/// use core::num::Complex;
+///
+/// let z: Matrix<Complex<f64>> = [[1.0 + 2.0i, 3.0i]];
+/// let h = linalg::adjoint(z);
+/// assert(h.shape() == [2, 1] && h[0, 0] == Complex::new(1.0, -2.0));
+/// ```
+pub fn adjoint<T: Scalar>(a: Matrix<T>) -> Matrix<T> {
+    if !T::COMPLEX { return a.t(); }
+    a.t().map(|x: T| -> T { x.conj() })
+}
+
+/// `mat![1, 2; 3, 4]`: a `Matrix<f64>` written row by row, MATLAB
+/// style, rows split by `;`. Rows of different lengths are a compile
+/// error, as in the nested-list form `[[1, 2], [3, 4]]`.
+///
+/// ```nabi
+/// use linalg::mat!;
+///
+/// let a = mat![1, 2; 3, 4.5];
+/// assert(a.shape() == [2, 2] && a[1, 1] == 4.5);
+/// ```
+#[impl_macro(mat)]
+pub @macro {
+    (@rep[sep = ";"] { @rep[sep = ","] { @x: expr } }) => {
+        pkg::build::rows([@for @x { [@for @x { @x, }], }])
+    }
+}
+
+/// The macro's expected type: makes the nested literal a `Matrix<f64>`.
+pub(pkg) fn rows(m: Matrix<f64>) -> Matrix<f64> { m }

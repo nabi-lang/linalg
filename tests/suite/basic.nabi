@@ -1,0 +1,165 @@
+use pkg::tests::suite::{EPS, close, crand, expect, fro, rand, throws_kind, units};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+/// Textbook triple loop.
+fn naive(a: Matrix<f64>, b: Matrix<f64>) -> Matrix<f64> {
+    let (m, k, n) = (a.shape()[0], a.shape()[1], b.shape()[1]);
+    Array::from_fn([m, n], |ix: [usize; 2]| -> f64 {
+        let s = 0.0;
+        for p in 0..k { s += a[ix[0], p] * b[p, ix[1]]; }
+        s
+    })
+}
+
+#[test]
+fn matmul_sizes() {
+    // Below the packing cutoff, packed, and parallel (m n k >= 128^3);
+    // odd sizes leave partial panels and k tails.
+    for (m, k, n) in [(1usize, 1usize, 1usize), (7, 5, 3), (33, 70, 31), (64, 64, 64), (150, 131, 170), (3, 300, 2)] {
+        let a = rand(m, k, (m * 31 + k) as u64);
+        let b = rand(k, n, (n * 17 + k) as u64);
+        let c = try! pkg::matmul(a, b);
+        let want = naive(a, b);
+        let r = fro(c .- want) / (fro(want) * (k as f64) * EPS);
+        expect(r < 2.0, f"matmul {m}x{k}x{n}: {r}");
+    }
+}
+
+#[test]
+fn matmul_tile_edges() {
+    // Row counts 1-3 past a tile of four, k tails past the four-k step
+    // and the 128-deep panel, column blocks past 256, and the parallel
+    // split with a short last block.
+    for (m, k, n) in [(5usize, 129usize, 257usize), (6, 130, 3), (7, 131, 260), (4, 4, 4), (2, 300, 300), (101, 64, 513), (260, 33, 129)] {
+        let a = rand(m, k, (m * 7 + k) as u64);
+        let b = rand(k, n, (n * 5 + k) as u64);
+        let c = try! pkg::matmul(a, b);
+        let want = naive(a, b);
+        let r = fro(c .- want) / (fro(want) * (k as f64) * EPS);
+        expect(r < 2.0, f"matmul {m}x{k}x{n}: {r}");
+    }
+    // f32 and complex through the packed paths.
+    let a = rand(37, 70, 11);
+    let b = rand(70, 45, 12);
+    let want = naive(a, b);
+    let f = try! pkg::matmul(a.map(|x: f64| -> f32 { x as f32 }), b.map(|x: f64| -> f32 { x as f32 }));
+    let e = fro(f.map(|x: f32| -> f64 { x as f64 }) .- want) / fro(want);
+    expect(e < 1e-5, f"f32 packed: {e}");
+    let za = crand(37, 70, 13);
+    let zb = crand(70, 45, 14);
+    let zc = try! pkg::matmul(za, zb);
+    for (i, j) in [(0usize, 0usize), (36, 44), (17, 3)] {
+        let s = Complex::new(0.0, 0.0);
+        for q in 0usize..70 { s = s + za[i, q] * zb[q, j]; }
+        expect((zc[i, j] - s).abs() < 1e-12, "complex packed");
+    }
+}
+
+#[test]
+fn matmul_views_and_types() {
+    let a = rand(9, 6, 1);
+    // A strided view goes in as its elements.
+    let v = a[::2, 1:];
+    let c = try! pkg::matmul(v, v.t());
+    let want = naive(v.copy(), v.t().copy());
+    expect(fro(c .- want) < 1e-14, "views");
+    let z = crand(5, 4, 2);
+    let w = crand(4, 3, 3);
+    let p = try! pkg::matmul(z, w);
+    for i in 0usize..5 {
+        for j in 0usize..3 {
+            let s = Complex::new(0.0, 0.0);
+            for q in 0usize..4 { s = s + z[i, q] * w[q, j]; }
+            expect((p[i, j] - s).abs() < 1e-14, "complex matmul");
+        }
+    }
+    let f = a.map(|x: f64| -> f32 { x as f32 });
+    let g = try! pkg::matmul(f.t(), f);
+    expect(g.shape() == [6, 6], "f32 shape");
+    let e: Matrix<f64> = Array::zeros([0, 3]);
+    let k: Matrix<f64> = Array::zeros([3, 4]);
+    expect((try! pkg::matmul(e, k)).shape() == [0, 4], "empty rows");
+    let e2: Matrix<f64> = Array::zeros([2, 0]);
+    let k2: Matrix<f64> = Array::zeros([0, 2]);
+    expect(try! pkg::matmul(e2, k2) == Matrix::<f64>::zeros([2, 2]), "empty inner dimension gives zeros");
+    expect(throws_kind(|| { _ = try pkg::matmul(a, a); }, "ShapeMismatch"), "9x6 times 9x6");
+}
+
+#[test]
+fn vector_products() {
+    let a: Matrix<f64> = [[1, 2, 3], [4, 5, 6]];
+    let x: Vector<f64> = [1, 0, -1];
+    let y: Vector<f64> = [1, 1];
+    expect(try! pkg::matvec(a, x) == Vector::<f64>::from([-2.0, -2.0]), "matvec");
+    expect(try! pkg::vecmat(y, a) == Vector::<f64>::from([5.0, 7.0, 9.0]), "vecmat");
+    expect(try! pkg::dot(x, x) == 2.0, "dot");
+    expect(throws_kind(|| { _ = try pkg::dot(x, y); }, "ShapeMismatch"), "dot lengths");
+    expect(throws_kind(|| { _ = try pkg::matvec(a, y); }, "ShapeMismatch"), "matvec lengths");
+    let z: Vector<Complex<f64>> = [1.0 + 2.0i, 3.0i];
+    expect(try! pkg::vdot(z, z) == Complex::new(14.0, 0.0), "vdot conjugates");
+    expect(try! pkg::dot(z, z) == Complex::new(-12.0, 4.0), "dot does not");
+    let o = pkg::outer(x, y);
+    expect(o.shape() == [3, 2] && o[2, 1] == -1.0, "outer");
+    // A long dot product: four partial sums, exact for integers.
+    let n = 1001usize;
+    let u: Vector<f64> = Array::from_fn([n], |i: [usize; 1]| -> f64 { i[0] as f64 });
+    close(try! pkg::dot(u, u), (n - 1) as f64 * (n as f64) * (2.0 * (n as f64) - 1.0) / 6.0, 0.0, "sum of squares");
+}
+
+#[test]
+fn build_and_kron() {
+    let i: Matrix<f64> = pkg::eye(3);
+    expect(try! pkg::trace(i) == 3.0, "trace");
+    let d = pkg::diag(Vector::<f64>::from([1.0, 2.0, 3.0]));
+    expect(pkg::diagonal(d) == Vector::<f64>::from([1.0, 2.0, 3.0]), "diag round trip");
+    expect(throws_kind(|| { _ = try pkg::trace(Matrix::<f64>::zeros([2, 3])); }, "NotSquare"), "trace of 2x3");
+    let a: Matrix<f64> = [[1, 2], [3, 4]];
+    let b: Matrix<f64> = [[0, 5], [6, 7]];
+    let k = pkg::kron(a, b);
+    let want: Matrix<f64> = [[0, 5, 0, 10], [6, 7, 12, 14], [0, 15, 0, 20], [18, 21, 24, 28]];
+    expect(k == want, f"kron {k:?}");
+    // (A x B)(C x D) = AC x BD.
+    let c = rand(2, 2, 4);
+    let e = rand(2, 2, 5);
+    let lhs = try! pkg::matmul(k, pkg::kron(c, e));
+    let rhs = pkg::kron(try! pkg::matmul(a, c), try! pkg::matmul(b, e));
+    expect(fro(lhs .- rhs) < 1e-13, "mixed product");
+    let z: Matrix<Complex<f64>> = [[1.0 + 1.0i, 2.0 + 0.0i]];
+    let h = pkg::adjoint(z);
+    expect(h.shape() == [2, 1] && h[0, 0] == Complex::new(1.0, -1.0), "adjoint");
+}
+
+#[test]
+fn powers() {
+    let f: Matrix<f64> = [[1, 1], [1, 0]];
+    let p = try! pkg::matrix_power(f, 30);
+    expect(p[0, 1] == 832040.0, "F30");
+    expect(try! pkg::matrix_power(f, 0) == pkg::eye::<f64>(2), "A^0");
+    expect(try! pkg::matrix_power(f, 1) == f, "A^1");
+    let m = try! pkg::matrix_power(f, -3);
+    let back = try! pkg::matmul(m, try! pkg::matrix_power(f, 3));
+    expect(units(back, pkg::eye::<f64>(2), 2) < 10.0, "A^-3 A^3 = I");
+    let s: Matrix<f64> = [[1, 2], [2, 4]];
+    expect(throws_kind(|| { _ = try pkg::matrix_power(s, -1); }, "Singular"), "singular power");
+}
+
+#[test]
+fn norms() {
+    let v: Vector<f64> = [3, -4];
+    expect(pkg::norm(v) == 5.0, "2-norm");
+    expect(pkg::vector_norm(v, pkg::Norm::One) == 7.0, "1-norm");
+    expect(pkg::vector_norm(v, pkg::Norm::Inf) == 4.0, "inf-norm");
+    let huge: Vector<f64> = [3e300, 4e300];
+    close(pkg::norm(huge), 5e300, 1e286, "no overflow");
+    let tiny: Vector<f64> = [3e-300, 4e-300];
+    close(pkg::norm(tiny), 5e-300, 1e-314, "no underflow");
+    let e: Vector<f64> = Array::zeros([0]);
+    expect(pkg::norm(e) == 0.0, "empty");
+    let a: Matrix<f64> = [[1, -2], [3, 4]];
+    close(try! pkg::matrix_norm(a, pkg::Norm::Two), 5.116672736008, 1e-11, "spectral");
+    let z: Matrix<Complex<f64>> = [[3.0i, 0.0i], [0.0i, 4.0 + 0.0i]];
+    close(try! pkg::matrix_norm(z, pkg::Norm::Two), 4.0, 1e-14, "complex spectral");
+    close(try! pkg::matrix_norm(z, pkg::Norm::Fro), 5.0, 1e-14, "complex frobenius");
+    close(try! pkg::matrix_norm(z, pkg::Norm::One), 4.0, 0.0, "complex one");
+}

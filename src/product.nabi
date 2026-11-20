@@ -1,0 +1,150 @@
+// Products: matrix-matrix, matrix-vector, dot, outer, Kronecker, powers.
+
+use pkg::blas::{cdot, dot as bdot, gemm, gemv, gevm};
+use pkg::dense::{Mat, vector};
+use pkg::error::{mismatch, square};
+use pkg::{LinalgError, Scalar};
+use core::array::{Array, Matrix, Vector};
+
+/// `a b` for an m x k and a k x n matrix. Cache-blocked; rows of the
+/// result are split across workers once m*n*k reaches 128^3. O(mnk).
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2], [3, 4]];
+/// let b: Matrix<f64> = [[0, 1], [1, 0]];
+/// assert(try linalg::matmul(a, b) == Matrix::<f64>::from_list([2.0, 1.0, 4.0, 3.0], [2, 2]));
+/// ```
+pub fn matmul<T: Scalar>(a: Matrix<T>, b: Matrix<T>) throws (LinalgError) -> Matrix<T> {
+    let (sa, sb) = (a.shape(), b.shape());
+    if sa[1] != sb[0] {
+        throw mismatch("matmul", f"{sa[0]} x {sa[1]}", f"{sb[0]} x {sb[1]}", "the columns of a must equal the rows of b");
+    }
+    gemm(Mat::of(a), Mat::of(b)).array()
+}
+
+/// `a x` for an m x n matrix and a vector of n. O(mn).
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[1, 2], [3, 4]];
+/// let x: Vector<f64> = [1, 1];
+/// assert(try linalg::matvec(a, x) == Vector::<f64>::from([3.0, 7.0]));
+/// ```
+pub fn matvec<T: Scalar>(a: Matrix<T>, x: Vector<T>) throws (LinalgError) -> Vector<T> {
+    let s = a.shape();
+    if s[1] != x.len() {
+        throw mismatch("matvec", f"{s[0]} x {s[1]}", f"a vector of {x.len()}", "x needs one element per column of a");
+    }
+    vector(gemv(Mat::of(a), Mat::col(x).d), s[0])
+}
+
+/// `x a` (`x` as a row) for a vector of m and an m x n matrix. O(mn).
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[1, 2], [3, 4]];
+/// let x: Vector<f64> = [1, 1];
+/// assert(try linalg::vecmat(x, a) == Vector::<f64>::from([4.0, 6.0]));
+/// ```
+pub fn vecmat<T: Scalar>(x: Vector<T>, a: Matrix<T>) throws (LinalgError) -> Vector<T> {
+    let s = a.shape();
+    if s[0] != x.len() {
+        throw mismatch("vecmat", f"a vector of {x.len()}", f"{s[0]} x {s[1]}", "x needs one element per row of a");
+    }
+    vector(gevm(Mat::col(x).d, Mat::of(a)), s[1])
+}
+
+/// `sum x[i] y[i]` (no conjugation; see `vdot`). Four partial sums.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1, 2, 3];
+/// assert(try linalg::dot(x, x) == 14.0);
+/// ```
+pub fn dot<T: Scalar>(x: Vector<T>, y: Vector<T>) throws (LinalgError) -> T {
+    if x.len() != y.len() {
+        throw mismatch("dot", f"a vector of {x.len()}", f"a vector of {y.len()}", "the vectors need the same length");
+    }
+    bdot(Mat::col(x).d, 0, Mat::col(y).d, 0, x.len())
+}
+
+/// `sum conj(x[i]) y[i]`, the inner product of complex vectors (`dot`
+/// for real ones).
+///
+/// ```nabi
+/// use core::array::Vector;
+/// use core::num::Complex;
+///
+/// let x: Vector<Complex<f64>> = [1.0 + 1.0i];
+/// assert(try linalg::vdot(x, x) == Complex::new(2.0, 0.0));
+/// ```
+pub fn vdot<T: Scalar>(x: Vector<T>, y: Vector<T>) throws (LinalgError) -> T {
+    if x.len() != y.len() {
+        throw mismatch("vdot", f"a vector of {x.len()}", f"a vector of {y.len()}", "the vectors need the same length");
+    }
+    cdot(Mat::col(x).d, 0, Mat::col(y).d, 0, x.len())
+}
+
+/// The outer product: element `(i, j)` is `x[i] y[j]`.
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let x: Vector<f64> = [1, 2];
+/// let y: Vector<f64> = [3, 4, 5];
+/// assert(linalg::outer(x, y)[1, 2] == 10.0);
+/// ```
+pub fn outer<T: Scalar>(x: Vector<T>, y: Vector<T>) -> Matrix<T> {
+    let (u, v) = (x.copy(), y.copy());
+    Array::from_fn([x.len(), y.len()], |ix: [usize; 2]| -> T { u[ix[0]] * v[ix[1]] })
+}
+
+/// The Kronecker product: the (p r) x (q s) block matrix whose block
+/// `(i, j)` is `a[i, j] b`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2]];
+/// let b: Matrix<f64> = [[1], [10]];
+/// assert(linalg::kron(a, b) == Matrix::<f64>::from_list([1.0, 2.0, 10.0, 20.0], [2, 2]));
+/// ```
+pub fn kron<T: Scalar>(a: Matrix<T>, b: Matrix<T>) -> Matrix<T> {
+    let (x, y) = (Mat::of(a), Mat::of(b));
+    let (p, q) = (y.r, y.c);
+    Array::from_fn([x.r * p, x.c * q], |ix: [usize; 2]| -> T {
+        x.at(ix[0] / p, ix[1] / q) * y.at(ix[0] % p, ix[1] % q)
+    })
+}
+
+/// `a` to the power `k` by repeated squaring (O(n^3 log k)); `k < 0`
+/// inverts first, `k = 0` is the identity.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let f: Matrix<f64> = [[1, 1], [1, 0]];
+/// assert((try linalg::matrix_power(f, 10))[0, 1] == 55.0);
+/// ```
+pub fn matrix_power<T: Scalar>(a: Matrix<T>, k: i64) throws (LinalgError) -> Matrix<T> {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let base: Mat<T> = if k < 0 { Mat::of(try pkg::inv(a)) } else { Mat::of(a) };
+    let e = if k < 0 { -k } else { k };
+    let acc: Mat<T> = Mat::eye(s[0]);
+    let first = true;
+    while e > 0 {
+        if e % 2 == 1 {
+            acc = if first { base.copy() } else { gemm(acc, base) };
+            first = false;
+        }
+        e /= 2;
+        if e > 0 { base = gemm(base, base); }
+    }
+    acc.array()
+}

@@ -1,0 +1,77 @@
+use pkg::tests::suite::{EPS, close, cfro, crand, expect, fro, rand, spd, throws_kind, units};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+#[test]
+fn exact() {
+    let a: Matrix<f64> = [[4, 12, -16], [12, 37, -43], [-16, -43, 98]];
+    let c = try! pkg::cholesky(a);
+    let want: Matrix<f64> = [[2, 0, 0], [6, 1, 0], [-8, 5, 3]];
+    expect(c.l() == want, f"L {c.l():?}");
+    close(c.det(), 36.0, 1e-9, "det");
+    close(c.logdet(), 36.0.ln(), 1e-12, "logdet");
+    let b: Vector<f64> = [1, 2, 3];
+    let x = try! c.solve(b);
+    let back = try! pkg::matvec(a, x);
+    for i in 0usize..3 { close(back[i], b[i], 1e-10, "solve"); }
+}
+
+#[test]
+fn reconstruction() {
+    for n in [1usize, 3, 17, 60] {
+        let a = spd(n, n as u64 + 40);
+        let c = try! pkg::cholesky(a);
+        let l = c.l();
+        let llt = try! pkg::matmul(l, l.t());
+        let r = units(a, llt, n);
+        expect(r < 4.0, f"||A - LL^T|| = {r} at n = {n}");
+        let i = try! c.inv();
+        expect(units(try! pkg::matmul(a, i), pkg::eye::<f64>(n), n) < 20.0, "inverse");
+    }
+}
+
+#[test]
+fn hermitian() {
+    let b = crand(6, 6, 9);
+    let a = try! pkg::matmul(b, pkg::adjoint(b));
+    let a = a .+ pkg::eye::<Complex<f64>>(6) .* Complex::new(6.0, 0.0);
+    let c = try! pkg::cholesky(a);
+    let l = c.l();
+    let r = cfro(a .- try! pkg::matmul(l, pkg::adjoint(l))) / (cfro(a) * 6.0 * EPS);
+    expect(r < 4.0, f"complex residual {r}");
+    for i in 0usize..6 { expect(l[i, i].im == 0.0 && l[i, i].re > 0.0, "real positive diagonal"); }
+}
+
+#[test]
+fn not_positive_definite() {
+    let a: Matrix<f64> = [[1, 2], [2, 1]];
+    let e = try { _ = try pkg::cholesky(a); pkg::LinalgError::NotFinite } catch e: pkg::LinalgError { e };
+    expect(e == pkg::LinalgError::NotPositiveDefinite { minor: 2 }, f"{e:?}");
+    expect(f"{e}".contains("ldlt"), "message names ldlt");
+    let z: Matrix<f64> = [[0]];
+    expect(throws_kind(|| { _ = try pkg::cholesky(z); }, "NotPositiveDefinite"), "zero");
+    let n: Matrix<f64> = [[f64::NAN]];
+    expect(throws_kind(|| { _ = try pkg::cholesky(n); }, "NotFinite"), "nan");
+    expect(throws_kind(|| { _ = try pkg::cholesky(Matrix::<f64>::zeros([2, 3])); }, "NotSquare"), "shape");
+}
+
+#[test]
+fn ldlt_indefinite() {
+    let a: Matrix<f64> = [[4, 2, -2], [2, -1, 3], [-2, 3, 1]];
+    let f = try! pkg::ldlt(a);
+    let d = f.d();
+    let l = f.l();
+    let ld = l .* d[none, :];
+    let back = try! pkg::matmul(ld, l.t());
+    expect(fro(back .- a) < 1e-13, f"LDL^T {back:?}");
+    expect(d[0] == 4.0 && d[1] == -2.0, f"d {d:?}");
+    close(f.det(), try! pkg::det(a), 1e-12, "det");
+    let b: Vector<f64> = [2, 4, 2];
+    let x = try! f.solve(b);
+    let back = try! pkg::matvec(a, x);
+    for i in 0usize..3 { close(back[i], b[i], 1e-12, "solve"); }
+    let s: Matrix<f64> = [[0, 1], [1, 0]];
+    expect(throws_kind(|| { _ = try pkg::ldlt(s); }, "Singular"), "zero leading minor");
+    let r = rand(5, 5, 2);
+    let _ = r;
+}

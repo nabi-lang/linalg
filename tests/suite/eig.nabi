@@ -1,0 +1,90 @@
+use pkg::tests::suite::{EPS, cfro, close, expect, fro, orth, rand, throws_kind, units};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+fn complex(a: Matrix<f64>) -> Matrix<Complex<f64>> { a.map(|x: f64| -> Complex<f64> { Complex::new(x, 0.0) }) }
+
+/// ||A V - V diag(w)|| / (||A|| n eps).
+fn resid(a: Matrix<f64>, e: pkg::Eig<f64>) -> f64 {
+    let v = e.vectors();
+    let av = try! pkg::matmul(complex(a), v);
+    let vl = v .* e.values()[none, :];
+    let n = a.shape()[0];
+    cfro(av .- vl) / (fro(a) * (n as f64) * EPS)
+}
+
+fn sorted_re(w: Vector<Complex<f64>>) -> List<f64> { w.to_list().map(|z: Complex<f64>| -> f64 { z.re }).sorted_by(|a, b| a.total_cmp(b)) }
+
+#[test]
+fn rotation() {
+    let t = 0.3;
+    let r: Matrix<f64> = [[t.cos(), -t.sin()], [t.sin(), t.cos()]];
+    let e = try! pkg::eig(r);
+    let w = e.values();
+    close(w[0].re, t.cos(), 1e-15, "re");
+    close(w[0].im, t.sin(), 1e-15, "im, positive first");
+    expect(w[1] == w[0].conj(), "conjugate pair");
+    expect(resid(r, e) < 8.0, "residual");
+}
+
+#[test]
+fn companion_roots() {
+    // x^3 - 6x^2 + 11x - 6 = (x - 1)(x - 2)(x - 3).
+    let c: Matrix<f64> = [[6, -11, 6], [1, 0, 0], [0, 1, 0]];
+    let e = try! pkg::eig(c);
+    let w = sorted_re(e.values());
+    for k in 0usize..3 { close(w[k], (k + 1) as f64, 1e-13, f"root {k}"); }
+    for z in e.values() { expect(z.im == 0.0, "real roots"); }
+    expect(resid(c, e) < 8.0, "residual");
+    // x^2 + 1 and x^2 + 4 together: +-i, +-2i.
+    let q: Matrix<f64> = [[0, -5, 0, -4], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]];
+    let e = try! pkg::eig(q);
+    let ims = e.values().to_list().map(|z: Complex<f64>| -> f64 { z.im.abs() }).sorted_by(|a, b| a.total_cmp(b));
+    close(ims[0], 1.0, 1e-13, "i");
+    close(ims[2], 2.0, 1e-13, "2i");
+    expect(resid(q, e) < 50.0, "residual of the quartic");
+}
+
+#[test]
+fn random_residuals() {
+    for n in [1usize, 3, 10, 40, 80] {
+        let a = rand(n, n, n as u64 + 11);
+        let e = try! pkg::eig(a);
+        let r = resid(a, e);
+        expect(r < 100.0, f"||AV - VW|| = {r} at n = {n}");
+        let tr = try! pkg::trace(a);
+        let s = 0.0;
+        for z in e.values() { s += z.re; }
+        close(s, tr, 1e-11 * (n as f64), "sum = trace");
+    }
+}
+
+#[test]
+fn schur_form() {
+    for n in [2usize, 6, 30] {
+        let a = rand(n, n, n as u64 + 5);
+        let s = try! pkg::schur(a);
+        let z = s.z();
+        let t = s.t();
+        let back = try! pkg::matmul(try! pkg::matmul(z, t), z.t());
+        let r = units(a, back, n);
+        expect(r < 20.0, f"||A - ZTZ^T|| = {r} at n = {n}");
+        expect(orth(z) < 20.0, "Z orthogonal");
+        for i in 0..n {
+            for j in 0..i {
+                if j + 1 < i { expect(t[i, j] == 0.0, "below the subdiagonal"); }
+            }
+        }
+        // A nonzero subdiagonal entry is a 2 x 2 block: no two in a row.
+        for i in 2..n { expect(t[i, i - 1] == 0.0 || t[i - 1, i - 2] == 0.0, "blocks are 2 x 2"); }
+        expect(s.values().len() == n, "values");
+    }
+    let tri: Matrix<f64> = [[1, 5, 7], [0, 2, 8], [0, 0, 3]];
+    let w = sorted_re((try! pkg::eig(tri)).values());
+    expect(w == [1.0, 2.0, 3.0], f"triangular {w:?}");
+    let nan: Matrix<f64> = [[f64::NAN]];
+    expect(throws_kind(|| { _ = try pkg::eig(nan); }, "NotFinite"), "nan");
+    expect((try! pkg::eig(Matrix::<f64>::zeros([0, 0]))).values().len() == 0, "empty");
+    let zero: Matrix<f64> = Array::zeros([3, 3]);
+    expect((try! pkg::eig(zero)).values() == Vector::<Complex<f64>>::full([3], Complex::new(0.0, 0.0)), "zero matrix");
+}

@@ -1,0 +1,172 @@
+//! Operators for matrix code (feature `ops`, on by default):
+//!
+//!   a @ b, a ⊡ b    matrix product (level of `*`)
+//!   a ⊗ b           Kronecker product; outer product of two vectors (`*`)
+//!   a \ b, a ⧵ b    solve a x = b, MATLAB's left division (`/`)
+//!   a†              adjoint, the conjugate transpose (postfix, level of `?`)
+//!
+//! Every operator also has a named form (`linalg::matmul(a, b)`, ...).
+
+use pkg::blas::{dot, gemm, gemv, gevm};
+use pkg::dense::{Mat, vector};
+use pkg::{LinalgError, Scalar};
+use core::array::{Matrix, Vector};
+
+/// `a @ b` (or `a ⊡ b`): the matrix product, with a vector on either
+/// side as a column (right) or a row (left), and the dot product of two
+/// vectors. Binds like `*`, so `a @ b .+ c` is `(a @ b) .+ c`. Shapes that do
+/// not fit panic, naming both, as the broadcast operators do;
+/// `linalg::matmul` throws instead.
+///
+/// ```nabi
+/// use core::array::{Array, Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[1, 2], [3, 4]];
+/// let x: Vector<f64> = [1, 1];
+/// assert(a @ x == Vector::<f64>::from([3.0, 7.0]));
+/// assert((a @ a)[1, 1] == 22.0);
+/// assert(a ⊡ a == a @ a);
+/// assert(x @ x == 2.0);
+/// ```
+pub trait MatMul<Rhs> {
+    type Output;
+    #[infix("@", like = "*")]
+    #[infix("⊡", like = "*")]
+    fn matmul(self, rhs: Rhs) -> Output;
+}
+
+// The trait arguments of these impls spell out `Array<T, 2>` /
+// `Array<T, 1>`: with the aliases the compiler takes the impls as
+// overlapping, and an imported `Array` used only there is reported
+// unused, hence the full path.
+
+fn fit(op: str, a: str, b: str) -> str { f"{op}: {a} and {b} do not fit" }
+
+impl<T: Scalar> MatMul<core::array::Array<T, 2>> for Matrix<T> {
+    type Output = Matrix<T>;
+    #[track_caller]
+    fn matmul(self, rhs: Matrix<T>) -> Matrix<T> {
+        let (s, t) = (self.shape(), rhs.shape());
+        if s[1] != t[0] { panic(fit("⊡", f"{s[0]} x {s[1]}", f"{t[0]} x {t[1]}") + "; the columns of a must equal the rows of b"); }
+        gemm(Mat::of(self), Mat::of(rhs)).array()
+    }
+}
+
+impl<T: Scalar> MatMul<core::array::Array<T, 1>> for Matrix<T> {
+    type Output = Vector<T>;
+    #[track_caller]
+    fn matmul(self, rhs: Vector<T>) -> Vector<T> {
+        let s = self.shape();
+        if s[1] != rhs.len() { panic(fit("⊡", f"{s[0]} x {s[1]}", f"a vector of {rhs.len()}")); }
+        vector(gemv(Mat::of(self), Mat::col(rhs).d), s[0])
+    }
+}
+
+impl<T: Scalar> MatMul<core::array::Array<T, 2>> for Vector<T> {
+    type Output = Vector<T>;
+    #[track_caller]
+    fn matmul(self, rhs: Matrix<T>) -> Vector<T> {
+        let s = rhs.shape();
+        if s[0] != self.len() { panic(fit("⊡", f"a vector of {self.len()}", f"{s[0]} x {s[1]}")); }
+        vector(gevm(Mat::col(self).d, Mat::of(rhs)), s[1])
+    }
+}
+
+impl<T: Scalar> MatMul<core::array::Array<T, 1>> for Vector<T> {
+    type Output = T;
+    #[track_caller]
+    fn matmul(self, rhs: Vector<T>) -> T {
+        if self.len() != rhs.len() { panic(fit("⊡", f"a vector of {self.len()}", f"a vector of {rhs.len()}")); }
+        dot(Mat::col(self).d, 0, Mat::col(rhs).d, 0, self.len())
+    }
+}
+
+/// `a ⊗ b`: the Kronecker product of two matrices, the outer product
+/// (a matrix) of two vectors. Binds like `*`.
+///
+/// ```nabi
+/// use core::array::{Array, Matrix, Vector};
+///
+/// let i: Matrix<f64> = linalg::eye(2);
+/// let b: Matrix<f64> = [[1, 2], [3, 4]];
+/// assert((i ⊗ b).shape() == [4, 4]);
+/// let u: Vector<f64> = [1, 2];
+/// assert((u ⊗ u)[1, 1] == 4.0);
+/// ```
+pub trait Kron<Rhs> {
+    type Output;
+    #[infix("⊗", like = "*")]
+    fn kron(self, rhs: Rhs) -> Output;
+}
+
+impl<T: Scalar> Kron<core::array::Array<T, 2>> for Matrix<T> {
+    type Output = Matrix<T>;
+    fn kron(self, rhs: Matrix<T>) -> Matrix<T> { pkg::kron(self, rhs) }
+}
+
+impl<T: Scalar> Kron<core::array::Array<T, 1>> for Vector<T> {
+    type Output = Matrix<T>;
+    fn kron(self, rhs: Vector<T>) -> Matrix<T> { pkg::outer(self, rhs) }
+}
+
+/// `a \ b` (or `a ⧵ b`): `x` with `a x = b`, MATLAB's left division, by
+/// LU for a square `a` and least squares (`lstsq`) otherwise. Operators
+/// do not throw, so the answer is a `Result`: `try (a \ b).get()`.
+/// Binds like `/`.
+///
+/// ```nabi
+/// use core::array::{Array, Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[3, 1], [1, 2]];
+/// let b: Vector<f64> = [9, 8];
+/// let x = try (a \ b).get();
+/// assert(x == Vector::<f64>::from([2.0, 3.0]));
+/// assert(try (a ⧵ b).get() == x);
+/// let s: Matrix<f64> = [[1, 2], [2, 4]];
+/// assert((s \ b).is_err());
+/// ```
+pub trait Solve<Rhs> {
+    type Output;
+    #[infix("\\", like = "/")]
+    #[infix("⧵", like = "/")]
+    fn solve(self, rhs: Rhs) -> Result<Output, LinalgError>;
+}
+
+impl<T: Scalar> Solve<core::array::Array<T, 1>> for Matrix<T> {
+    type Output = Vector<T>;
+    fn solve(self, rhs: Vector<T>) -> Result<Vector<T>, LinalgError> { Result::catching(|| try left_div(self, rhs)) }
+}
+
+impl<T: Scalar> Solve<core::array::Array<T, 2>> for Matrix<T> {
+    type Output = Matrix<T>;
+    fn solve(self, rhs: Matrix<T>) -> Result<Matrix<T>, LinalgError> { Result::catching(|| try left_div(self, rhs)) }
+}
+
+fn left_div<T: Scalar, B: pkg::Rhs<T>>(a: Matrix<T>, b: B) throws (LinalgError) -> B {
+    let s = a.shape();
+    if s[0] == s[1] { try pkg::solve(a, b) } else { try pkg::lstsq(a, b) }
+}
+
+/// `a†`: the adjoint (conjugate transpose); for a real matrix the
+/// transpose, as a view. Postfix, binding like `?`: `a† @ a` is
+/// `(a†) @ a`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+/// use core::num::Complex;
+///
+/// let a: Matrix<f64> = [[1, 2, 3]];
+/// assert(a†.shape() == [3, 1]);
+/// let z: Matrix<Complex<f64>> = [[1.0 + 1.0i]];
+/// assert(z†[0, 0] == Complex::new(1.0, -1.0));
+/// ```
+pub trait Adjoint {
+    type Output;
+    #[postfix("†", like = "?")]
+    fn adjoint(self) -> Output;
+}
+
+impl<T: Scalar> Adjoint for Matrix<T> {
+    type Output = Matrix<T>;
+    fn adjoint(self) -> Matrix<T> { pkg::adjoint(self) }
+}

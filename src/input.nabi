@@ -1,0 +1,89 @@
+//! `AsVector`: the one-dimensional input every science package takes,
+//! so a list, a fixed array, an integer range or a `Vector` of another
+//! element type works wherever a `Vector` does.
+
+use core::array::{Array, Vector};
+use core::num::Complex;
+use core::range::Range;
+
+/// Something that reads as a `Vector<T>`: a `Vector<T>` itself, a
+/// `List<T>` or a `[T; K]`; for `T = f64` also vectors, lists and fixed
+/// arrays of `f32`, `i64`, `i32` and `usize`, and an `i64` range; for
+/// `T = Complex<f64>` real `f64` data. A `Vector<T>` and a `List<T>` are
+/// shared, not copied (a function taking `AsVector` never writes to its
+/// input); every other form is a converted copy.
+///
+/// Take it as a bound to accept all of them with one signature. Give
+/// the result its type (`let v: Vector<f64> = ..`): a list of `f32`
+/// reads as a `Vector<f32>` too, and the annotation picks the one
+/// meant.
+///
+/// ```nabi
+/// use linalg::AsVector;
+/// use core::array::Vector;
+///
+/// fn total<X: AsVector<f64>>(x: X) -> f64 {
+///     let v: Vector<f64> = x.as_vector();
+///     v.sum()
+/// }
+///
+/// let v: Vector<f64> = [1, 2, 3];
+/// assert(total(v) == 6.0);
+/// assert(total([1, 2, 3]) == 6.0);
+/// assert(total([0.5, 1.5]) == 2.0);
+/// assert(total([1.5f32, 2.5f32]) == 4.0);
+/// assert(total(1..4) == 6.0);
+/// ```
+pub trait AsVector<T> {
+    /// `self` as a vector (see the trait for when it is a copy).
+    fn as_vector(self) -> Vector<T>;
+}
+
+impl<T> AsVector<T> for Vector<T> {
+    fn as_vector(self) -> Vector<T> { self }
+}
+
+impl<T> AsVector<T> for List<T> {
+    fn as_vector(self) -> Vector<T> { Array::view_list(self, [self.len()]) }
+}
+
+impl<T: Copy, const K: usize> AsVector<T> for [T; K] {
+    fn as_vector(self) -> Vector<T> { Array::from_list(List::from_fn(K, |i| self[i]), [K]) }
+}
+
+impl AsVector<f64> for Range<i64> {
+    fn as_vector(self) -> Vector<f64> {
+        let n = if self.end > self.start { (self.end - self.start) as usize } else { 0 };
+        Array::from_list(List::from_fn(n, |i| (self.start + i as i64) as f64), [n])
+    }
+}
+
+#[impl_macro(widen)] @macro {
+    (@rep[sep = ","] { @t: ty }) => {
+        @for @t {
+            impl AsVector<f64> for Vector<@t> {
+                fn as_vector(self) -> Vector<f64> { self.map(|x: @t| -> f64 { x as f64 }) }
+            }
+
+            impl AsVector<f64> for List<@t> {
+                fn as_vector(self) -> Vector<f64> { Array::from_list(List::from_fn(self.len(), |i| self[i] as f64), [self.len()]) }
+            }
+
+            impl<const K: usize> AsVector<f64> for [@t; K] {
+                fn as_vector(self) -> Vector<f64> { Array::from_list(List::from_fn(K, |i| self[i] as f64), [K]) }
+            }
+        }
+    }
+}
+
+widen!(f32, i64, i32, usize);
+
+impl AsVector<Complex<f64>> for Vector<f64> {
+    fn as_vector(self) -> Vector<Complex<f64>> { self.map(|x: f64| -> Complex<f64> { Complex { re: x, im: 0.0 } }) }
+}
+
+impl AsVector<Complex<f64>> for List<f64> {
+    fn as_vector(self) -> Vector<Complex<f64>> {
+        Array::from_list(List::from_fn(self.len(), |i| Complex { re: self[i], im: 0.0 }), [self.len()])
+    }
+}

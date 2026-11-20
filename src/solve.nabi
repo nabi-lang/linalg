@@ -1,0 +1,285 @@
+// Solvers and the quantities read off a factorization: square solve,
+// least squares, inverse, pseudo-inverse, determinant, rank, condition
+// number, null space, triangular solves.
+
+use pkg::blas::trsm;
+use pkg::dense::Mat;
+use pkg::error::{mismatch, square};
+use pkg::factor::qr::{Qr, factor as qr_factor};
+use pkg::factor::svd::{factor as svd_factor};
+use pkg::scalar::{eps, inf, one, real, zero};
+use pkg::{LinalgError, Real, Rhs, Scalar};
+use core::array::{Array, Matrix, Vector};
+
+/// Which triangle of a matrix holds the data.
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+/// use linalg::Triangle;
+///
+/// let u: Matrix<f64> = [[1, 1], [0, 2]];
+/// let b: Vector<f64> = [3, 4];
+/// assert(try linalg::solve_triangular(u, b, Triangle::Upper) == Vector::<f64>::from([1.0, 2.0]));
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Triangle {
+    Lower,
+    Upper,
+}
+
+/// `x` with `a x = b` for a square `a`, by LU with partial pivoting;
+/// `b` is a vector or a matrix of columns. Throws `Singular` for a zero
+/// pivot. O(2n^3/3 + 2n^2 k).
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let a: Matrix<f64> = [[3, 1], [1, 2]];
+/// let b: Vector<f64> = [9, 8];
+/// let x = try linalg::solve(a, b);
+/// assert(x == Vector::<f64>::from([2.0, 3.0]));
+/// let r = a @ x .- b |> linalg::norm;           // the residual
+/// assert(r == 0.0);
+/// ```
+pub fn solve<T: Scalar, B: Rhs<T>>(a: Matrix<T>, b: B) throws (LinalgError) -> B {
+    try (try pkg::lu(a)).solve(b)
+}
+
+/// `a^-1` by LU. Throws `Singular` for a zero pivot; prefer `solve` to
+/// multiplying by the inverse.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[2, 0], [0, 4]];
+/// assert((try linalg::inv(a))[1, 1] == 0.25);
+/// ```
+pub fn inv<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Matrix<T> {
+    try (try pkg::lu(a)).inv()
+}
+
+/// `det(a)` by LU (0 for a singular matrix).
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2], [3, 4]];
+/// assert((try linalg::det(a) + 2.0).abs() < 1e-12);
+/// ```
+pub fn det<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> T {
+    (try pkg::lu(a)).det()
+}
+
+/// `(sign, ln |det(a)|)`: `det(a) = sign * exp(logabs)` without
+/// overflow. `sign` has modulus 1 (+-1 for a real matrix), or is 0 with
+/// `logabs = -inf` for a singular one.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1e200, 0], [0, -1e200]];
+/// let (s, l) = try linalg::slogdet(a);
+/// assert(s == -1.0 && (l - 400.0 * 10.0.ln()).abs() < 1e-9);
+/// ```
+pub fn slogdet<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> (T, T::Real) {
+    let f = try pkg::lu(a);
+    let sign = if f.sign < 0 { -T::one() } else { T::one() };
+    let l = zero::<T::Real>();
+    for i in 0..f.f.r {
+        let d = f.f.at(i, i);
+        let m = d.modulus();
+        if m == zero::<T::Real>() { return (T::zero(), -inf::<T::Real>()); }
+        sign = sign * d.scale(one::<T::Real>() / m);
+        l = l + m.ln();
+    }
+    (sign, l)
+}
+
+/// The least-squares solution of `a x = b` (m x n `a`, any shape and
+/// rank): minimizes `||a x - b||`, and among minimizers `||x||`. A
+/// pivoted QR finds the numerical rank (diagonal of R above
+/// max(m, n) * eps * |R[0, 0]|); a full-rank problem is solved from R,
+/// a deficient one through a complete orthogonal decomposition (LAPACK's
+/// xGELSY). O(mn^2).
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// // Fit y = c0 + c1 t through (0, 1), (1, 3), (2, 5).
+/// let a: Matrix<f64> = [[1, 0], [1, 1], [1, 2]];
+/// let y: Vector<f64> = [1, 3, 5];
+/// let c = try linalg::lstsq(a, y);
+/// assert((c[0] - 1.0).abs() < 1e-12 && (c[1] - 2.0).abs() < 1e-12);
+/// ```
+pub fn lstsq<T: Scalar, B: Rhs<T>>(a: Matrix<T>, b: B) throws (LinalgError) -> B {
+    let bm: Mat<T> = Mat::of(b.matrix());
+    let s = a.shape();
+    if bm.r != s[0] {
+        throw mismatch("lstsq", f"{s[0]} x {s[1]}", f"{bm.r} rows", "b needs one row per row of a");
+    }
+    if !bm.finite() { throw LinalgError::NotFinite; }
+    let f = try qr_factor(a, true);
+    let r = qr_rank(f);
+    let (m, n) = (s[0], s[1]);
+    if r == n && m >= n { return b.like((try f.solve_mat(bm)).array()); }
+    let w = bm.c;
+    let y = bm.copy();
+    f.qh_apply(y);
+    if r == 0 { return b.like(Mat::<T>::zeros(n, w).array()); }
+    // [R11 R12] = S^H Z^H from the QR of its adjoint (n x r).
+    let top = f.f.sub(0, r, 0, n);
+    for i in 0..r {
+        for j in 0..i { top.put(i, j, T::zero()); }
+    }
+    let g = try qr_factor(top.t(true).array(), false);
+    let c = y.sub(0, r, 0, w);
+    trsm(g.f.sub(0, r, 0, r), c, false, true, false);
+    // x_perm = Z[:, 0..r] c; x[perm[j]] = x_perm[j].
+    let z = g.q_mat(false);
+    let x: Mat<T> = Mat::zeros(n, w);
+    for j in 0..n {
+        for k in 0..w {
+            let acc = T::zero();
+            for p in 0..r { acc = acc + z.at(j, p) * c.at(p, k); }
+            x.put(f.perm[j], k, acc);
+        }
+    }
+    b.like(x.array())
+}
+
+/// The numerical rank from the falling diagonal of a pivoted R.
+fn qr_rank<T: Scalar>(f: Qr<T>) -> usize {
+    let (m, n) = (f.f.r, f.f.c);
+    let k = m.min(n);
+    if k == 0 { return 0; }
+    let top = f.f.at(0, 0).modulus();
+    let tol = real::<T::Real>(m.max(n) as f64) * eps::<T::Real>() * top;
+    let r = 0usize;
+    while r < k && f.f.at(r, r).modulus() > tol { r += 1; }
+    r
+}
+
+/// The singular values of `a`, largest first; complex matrices go
+/// through the real form [[Re, -Im], [Im, Re]], whose singular values
+/// are those of `a`, each twice.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[0, 2], [1, 0]];
+/// let s = try linalg::svdvals(a);
+/// assert(s[0] == 2.0 && s[1] == 1.0);
+/// ```
+pub fn svdvals<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Vector<T::Real> {
+    let sh = a.shape();
+    if !T::COMPLEX {
+        let x = a.map(|v: T| -> T::Real { v.re() });
+        return (try svd_factor(x, false, false)).s();
+    }
+    let (m, n) = (sh[0], sh[1]);
+    let x = Mat::of(a);
+    let e: Matrix<T::Real> = Array::from_fn([2 * m, 2 * n], |ix: [usize; 2]| -> T::Real {
+        let v = x.at(ix[0] % m, ix[1] % n);
+        let (lo, right) = (ix[0] >= m, ix[1] >= n);
+        if lo == right { v.re() } else if right { -v.im() } else { v.im() }
+    });
+    let s = (try svd_factor(e, false, false)).s();
+    Array::from_fn([m.min(n)], |ix: [usize; 1]| -> T::Real { s[2 * ix[0]] })
+}
+
+/// The number of singular values above max(m, n) * eps * s_max.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2], [2, 4], [3, 6]];
+/// assert(try linalg::rank(a) == 1);
+/// ```
+pub fn rank<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> usize {
+    let sh = a.shape();
+    let s = try svdvals(a);
+    if s.len() == 0 { return 0; }
+    let tol = real::<T::Real>(sh[0].max(sh[1]) as f64) * eps::<T::Real>() * s[0];
+    let r = 0usize;
+    for x in s {
+        if x > tol { r += 1; }
+    }
+    r
+}
+
+/// The 2-norm condition number `s_max / s_min` (infinite for a
+/// rank-deficient matrix). log10 of it is about the digits a solve
+/// loses.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 0], [0, 1e-3]];
+/// assert((try linalg::cond(a) - 1e3).abs() < 1e-9);
+/// ```
+pub fn cond<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> T::Real {
+    let s = try svdvals(a);
+    let k = s.len();
+    if k == 0 { return zero::<T::Real>(); }
+    if s[k - 1] == zero::<T::Real>() { return inf::<T::Real>(); }
+    s[0] / s[k - 1]
+}
+
+/// The Moore-Penrose pseudo-inverse `V S^+ U^T` (n x m), singular
+/// values at or below max(m, n) * eps * s_max taken as zero.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 0], [0, 0]];
+/// assert(try linalg::pinv(a) == a);
+/// ```
+pub fn pinv<T: Real>(a: Matrix<T>) throws (LinalgError) -> Matrix<T> {
+    let f = try svd_factor(a, false, true);
+    (try f.solve_mat(Mat::eye(f.u.r), none)).array()
+}
+
+/// An orthonormal basis of the null space `{x : a x = 0}`, as the
+/// columns of an n x (n - rank) matrix (from the trailing rows of V^T).
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 1]];
+/// let z = try linalg::null_space(a);
+/// assert(z.shape() == [2, 1] && (z[0, 0] + z[1, 0]).abs() < 1e-12);
+/// ```
+pub fn null_space<T: Real>(a: Matrix<T>) throws (LinalgError) -> Matrix<T> {
+    let n = a.shape()[1];
+    let f = try svd_factor(a, true, true);
+    let r = f.rank(none);
+    let vt = f.vt;
+    Array::from_fn([n, n - r], |ix: [usize; 2]| -> T { vt.at(r + ix[1], ix[0]) })
+}
+
+/// `x` with `t x = b` for a square triangular `t`, by substitution; only
+/// the given triangle of `t` is read. Throws `Singular` for a zero on
+/// the diagonal. O(n^2 k).
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+/// use linalg::Triangle;
+///
+/// let l: Matrix<f64> = [[2, 0], [1, 1]];
+/// let b: Vector<f64> = [2, 3];
+/// assert(try linalg::solve_triangular(l, b, Triangle::Lower) == Vector::<f64>::from([1.0, 2.0]));
+/// ```
+pub fn solve_triangular<T: Scalar, B: Rhs<T>>(t: Matrix<T>, b: B, part: Triangle) throws (LinalgError) -> B {
+    let s = t.shape();
+    try square(s[0], s[1]);
+    let tm: Mat<T> = Mat::of(t);
+    let x: Mat<T> = Mat::of(b.matrix());
+    if x.r != s[0] {
+        throw mismatch("solve_triangular", f"{s[0]} x {s[1]}", f"{x.r} rows", "b needs one row per row of t");
+    }
+    for i in 0..s[0] {
+        if tm.at(i, i) == T::zero() { throw LinalgError::Singular { pivot: i }; }
+    }
+    trsm(tm, x, part == Triangle::Lower, false, false);
+    b.like(x.array())
+}

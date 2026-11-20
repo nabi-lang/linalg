@@ -1,0 +1,342 @@
+// Level 1-3 kernels on `Mat`. Inner loops run over contiguous rows so
+// the vectorizer takes them; `gemm` packs B into panels and splits the
+// rows of C across workers when the product is large.
+
+use pkg::Scalar;
+use pkg::dense::{Mat, buf};
+use bare::mem::GcBuf;
+
+// Below this m*n*k a plain i-k-j loop wins over packing.
+const SMALL: usize = 32768;
+// From this m*n*k on, row blocks of C go to the workers.
+const PAR: usize = 2097152;
+// A KB x JB panel of B (256 KiB of f64) stays in L2; the MR x JB tile
+// of C and the MR rows of the panel a step reads stay in L1.
+const KB: usize = 128;
+const JB: usize = 256;
+// Rows of C a worker takes at a time, at most (a multiple of MR); a
+// short C gets thinner blocks so every worker has some.
+const IB: usize = 32;
+// Rows of C per tile: each element of B loaded feeds MR rows.
+const MR: usize = 4;
+// Up to this k, clearing and adding back the tiles costs more than the
+// shared loads of B save.
+const THIN: usize = 32;
+
+/// `a b`. Real types: B packed into KB x JB panels, then MR x JB tiles
+/// of C, each updated four `k` at a time so a load of B feeds four
+/// rows and the tile rows stay in L1; complex types and a thin k: i-k-j
+/// over the same panels. Row blocks of C go to the workers when large; O(mnk).
+pub(pkg) fn gemm<T: Scalar>(a: Mat<T>, b: Mat<T>) -> Mat<T> {
+    let m = a.r;
+    let k = a.c;
+    let n = b.c;
+    let c: Mat<T> = Mat::zeros(m, n);
+    if m == 0 || n == 0 || k == 0 { return c; }
+    let work = m * n * k;
+    if work < SMALL {
+        small(a.d, b.d, c.d, m, k, n);
+        return c;
+    }
+    // Panel J (columns j0..j0 + w) starts at k * j0, row p at + p * w.
+    let bp: GcBuf<T> = buf(k * n);
+    let j0 = 0usize;
+    unsafe {
+        while j0 < n {
+            let w = JB.min(n - j0);
+            let base = k * j0;
+            for p in 0..k {
+                let s = p * n + j0;
+                let o = base + p * w;
+                for j in 0..w { bp.set(o + j, b.d.get(s + j)); }
+            }
+            j0 += w;
+        }
+    }
+    let ad = a.d;
+    let cd = c.d;
+    let run = |i0: usize, i1: usize| { if T::COMPLEX || k <= THIN { block(ad, bp, cd, k, n, i0, i1); } else { tiles(ad, bp, cd, k, n, i0, i1); } };
+    if work >= PAR && m > MR {
+        let ib = IB.min(((m + 31) / 32 + MR - 1) / MR * MR);
+        let starts: List<usize> = List::with_capacity(m / ib + 1);
+        let i0 = 0usize;
+        while i0 < m {
+            starts.push(i0);
+            i0 += ib;
+        }
+        par::for_each(starts, |i0: usize| { run(i0, m.min(i0 + ib)); });
+    } else {
+        run(0, m);
+    }
+    c
+}
+
+fn small<T: Scalar>(a: GcBuf<T>, b: GcBuf<T>, c: GcBuf<T>, m: usize, k: usize, n: usize) {
+    unsafe {
+        for i in 0..m {
+            let co = i * n;
+            for p in 0..k {
+                let x = a.get(i * k + p);
+                let bo = p * n;
+                for j in 0..n { c.set(co + j, c.get(co + j) + x * b.get(bo + j)); }
+            }
+        }
+    }
+}
+
+/// The MR rows of a C tile, in separate buffers.
+struct Tile<T> {
+    r0: GcBuf<T>;
+    r1: GcBuf<T>;
+    r2: GcBuf<T>;
+    r3: GcBuf<T>;
+}
+
+/// Rows `i0..i1` of C += A B over the packed panels `bp`, MR rows at a
+/// time. The tile rows are separate buffers: stores to rows of one
+/// buffer keep the vectorizer off the loop, as it cannot rule out
+/// their overlap.
+fn tiles<T: Scalar>(a: GcBuf<T>, bp: GcBuf<T>, c: GcBuf<T>, k: usize, n: usize, i0: usize, i1: usize) {
+    let w0 = JB.min(n);
+    let t: Tile<T> = Tile { r0: buf(w0), r1: buf(w0), r2: buf(w0), r3: buf(w0) };
+    let (r0, r1, r2, r3) = (t.r0, t.r1, t.r2, t.r3);
+    unsafe {
+        let j0 = 0usize;
+        while j0 < n {
+            let w = JB.min(n - j0);
+            let base = k * j0;
+            let p0 = 0usize;
+            while p0 < k {
+                let pe = KB.min(k - p0) + p0;
+                let i = i0;
+                while i < i1 {
+                    let h = MR.min(i1 - i);
+                    for j in 0..w {
+                        r0.set(j, T::zero());
+                        r1.set(j, T::zero());
+                        r2.set(j, T::zero());
+                        r3.set(j, T::zero());
+                    }
+                    if h == MR {
+                        tile(a, i * k, k, bp, base, w, p0, pe, t);
+                    } else {
+                        // A short last tile: the rows past i1 read row i again
+                        // and are not written back.
+                        let o1 = if h > 1 { (i + 1) * k } else { i * k };
+                        let o2 = if h > 2 { (i + 2) * k } else { i * k };
+                        edge(a, [i * k, o1, o2], bp, base, w, p0, pe, t);
+                    }
+                    let co = i * n + j0;
+                    for j in 0..w { c.set(co + j, c.get(co + j) + r0.get(j)); }
+                    if h > 1 {
+                        let co = co + n;
+                        for j in 0..w { c.set(co + j, c.get(co + j) + r1.get(j)); }
+                    }
+                    if h > 2 {
+                        let co = co + 2 * n;
+                        for j in 0..w { c.set(co + j, c.get(co + j) + r2.get(j)); }
+                    }
+                    if h > 3 {
+                        let co = co + 3 * n;
+                        for j in 0..w { c.set(co + j, c.get(co + j) + r3.get(j)); }
+                    }
+                    i += MR;
+                }
+                p0 = pe;
+            }
+            j0 += w;
+        }
+    }
+}
+
+/// The microkernel: tile rows `r0..r3` += A[rows at ao + q k, p0..pe]
+/// times panel rows p0..pe (width w at base + p w). Four `k` per pass:
+/// four loads of B and 32 multiply-adds per column, in the inner loop
+/// the vectorizer takes; the 16 A values stay in registers.
+fn tile<T: Scalar>(a: GcBuf<T>, ao: usize, k: usize, bp: GcBuf<T>, base: usize, w: usize, p0: usize, pe: usize, t: Tile<T>) {
+    let (r0, r1, r2, r3) = (t.r0, t.r1, t.r2, t.r3);
+    unsafe {
+        let a1o = ao + k;
+        let a2o = a1o + k;
+        let a3o = a2o + k;
+        let p = p0;
+        while p + 4 <= pe {
+            let (x00, x01, x02, x03) = (a.get(ao + p), a.get(ao + p + 1), a.get(ao + p + 2), a.get(ao + p + 3));
+            let (x10, x11, x12, x13) = (a.get(a1o + p), a.get(a1o + p + 1), a.get(a1o + p + 2), a.get(a1o + p + 3));
+            let (x20, x21, x22, x23) = (a.get(a2o + p), a.get(a2o + p + 1), a.get(a2o + p + 2), a.get(a2o + p + 3));
+            let (x30, x31, x32, x33) = (a.get(a3o + p), a.get(a3o + p + 1), a.get(a3o + p + 2), a.get(a3o + p + 3));
+            let b0 = base + p * w;
+            let b1 = b0 + w;
+            let b2 = b1 + w;
+            let b3 = b2 + w;
+            for j in 0..w {
+                let y0 = bp.get(b0 + j);
+                let y1 = bp.get(b1 + j);
+                let y2 = bp.get(b2 + j);
+                let y3 = bp.get(b3 + j);
+                r0.set(j, r0.get(j) + x00 * y0 + x01 * y1 + x02 * y2 + x03 * y3);
+                r1.set(j, r1.get(j) + x10 * y0 + x11 * y1 + x12 * y2 + x13 * y3);
+                r2.set(j, r2.get(j) + x20 * y0 + x21 * y1 + x22 * y2 + x23 * y3);
+                r3.set(j, r3.get(j) + x30 * y0 + x31 * y1 + x32 * y2 + x33 * y3);
+            }
+            p += 4;
+        }
+        while p < pe {
+            let (x0, x1, x2, x3) = (a.get(ao + p), a.get(a1o + p), a.get(a2o + p), a.get(a3o + p));
+            let bo = base + p * w;
+            for j in 0..w {
+                let y = bp.get(bo + j);
+                r0.set(j, r0.get(j) + x0 * y);
+                r1.set(j, r1.get(j) + x1 * y);
+                r2.set(j, r2.get(j) + x2 * y);
+                r3.set(j, r3.get(j) + x3 * y);
+            }
+            p += 1;
+        }
+    }
+}
+
+/// `tile` for the last one to three rows: three rows at offsets `o`
+/// into the first three rows of `t`.
+fn edge<T: Scalar>(a: GcBuf<T>, o: [usize; 3], bp: GcBuf<T>, base: usize, w: usize, p0: usize, pe: usize, t: Tile<T>) {
+    let (r0, r1, r2) = (t.r0, t.r1, t.r2);
+    let (o0, o1, o2) = (o[0], o[1], o[2]);
+    unsafe {
+        for p in p0..pe {
+            let (x0, x1, x2) = (a.get(o0 + p), a.get(o1 + p), a.get(o2 + p));
+            let bo = base + p * w;
+            for j in 0..w {
+                let y = bp.get(bo + j);
+                r0.set(j, r0.get(j) + x0 * y);
+                r1.set(j, r1.get(j) + x1 * y);
+                r2.set(j, r2.get(j) + x2 * y);
+            }
+        }
+    }
+}
+
+/// Rows `i0..i1` of C += A B over the packed panels `bp`.
+fn block<T: Scalar>(a: GcBuf<T>, bp: GcBuf<T>, c: GcBuf<T>, k: usize, n: usize, i0: usize, i1: usize) {
+    unsafe {
+        let j0 = 0usize;
+        while j0 < n {
+            let w = JB.min(n - j0);
+            let base = k * j0;
+            let p0 = 0usize;
+            while p0 < k {
+                let pe = KB.min(k - p0) + p0;
+                for i in i0..i1 {
+                    let co = i * n + j0;
+                    let ao = i * k;
+                    let p = p0;
+                    while p + 4 <= pe {
+                        let a0 = a.get(ao + p);
+                        let a1 = a.get(ao + p + 1);
+                        let a2 = a.get(ao + p + 2);
+                        let a3 = a.get(ao + p + 3);
+                        let b0 = base + p * w;
+                        let b1 = b0 + w;
+                        let b2 = b1 + w;
+                        let b3 = b2 + w;
+                        for j in 0..w {
+                            c.set(co + j, c.get(co + j) + a0 * bp.get(b0 + j) + a1 * bp.get(b1 + j)
+                                + a2 * bp.get(b2 + j) + a3 * bp.get(b3 + j));
+                        }
+                        p += 4;
+                    }
+                    while p < pe {
+                        let x = a.get(ao + p);
+                        let bo = base + p * w;
+                        for j in 0..w { c.set(co + j, c.get(co + j) + x * bp.get(bo + j)); }
+                        p += 1;
+                    }
+                }
+                p0 = pe;
+            }
+            j0 += w;
+        }
+    }
+}
+
+/// `sum x[xo + i] * y[yo + i]` for `i < n`, four partial sums.
+pub(pkg) fn dot<T: Scalar>(x: GcBuf<T>, xo: usize, y: GcBuf<T>, yo: usize, n: usize) -> T {
+    let s0 = T::zero();
+    let s1 = T::zero();
+    let s2 = T::zero();
+    let s3 = T::zero();
+    let i = 0usize;
+    unsafe {
+        while i + 4 <= n {
+            s0 = s0 + x.get(xo + i) * y.get(yo + i);
+            s1 = s1 + x.get(xo + i + 1) * y.get(yo + i + 1);
+            s2 = s2 + x.get(xo + i + 2) * y.get(yo + i + 2);
+            s3 = s3 + x.get(xo + i + 3) * y.get(yo + i + 3);
+            i += 4;
+        }
+        while i < n {
+            s0 = s0 + x.get(xo + i) * y.get(yo + i);
+            i += 1;
+        }
+    }
+    (s0 + s1) + (s2 + s3)
+}
+
+/// `sum conj(x[xo + i]) * y[yo + i]`.
+pub(pkg) fn cdot<T: Scalar>(x: GcBuf<T>, xo: usize, y: GcBuf<T>, yo: usize, n: usize) -> T {
+    if !T::COMPLEX { return dot(x, xo, y, yo, n); }
+    let s = T::zero();
+    unsafe {
+        for i in 0..n { s = s + x.get(xo + i).conj() * y.get(yo + i); }
+    }
+    s
+}
+
+/// `y[yo..yo + n] -= s * x[xo..xo + n]`.
+pub(pkg) fn axpy<T: Scalar>(s: T, x: GcBuf<T>, xo: usize, y: GcBuf<T>, yo: usize, n: usize) {
+    unsafe {
+        for i in 0..n { y.set(yo + i, y.get(yo + i) - s * x.get(xo + i)); }
+    }
+}
+
+/// `a x` for a column `x` (length a.c).
+pub(pkg) fn gemv<T: Scalar>(a: Mat<T>, x: GcBuf<T>) -> GcBuf<T> {
+    let y: GcBuf<T> = buf(a.r);
+    unsafe {
+        for i in 0..a.r { y.set(i, dot(a.d, i * a.c, x, 0, a.c)); }
+    }
+    y
+}
+
+/// `x a` for a row `x` (length a.r).
+pub(pkg) fn gevm<T: Scalar>(x: GcBuf<T>, a: Mat<T>) -> GcBuf<T> {
+    let y: GcBuf<T> = buf(a.c);
+    unsafe {
+        for i in 0..a.r { axpy(-x.get(i), a.d, i * a.c, y, 0, a.c); }
+    }
+    y
+}
+
+/// Solve `op(t) x = b` in place in `b` (`t` square triangular, `b`
+/// t.r x b.c): `lower` picks the triangle of `t`, `adj` uses its adjoint,
+/// `unit` takes the diagonal as ones. Row operations on `b`; O(n^2 b.c).
+pub(pkg) fn trsm<T: Scalar>(t: Mat<T>, b: Mat<T>, lower: bool, adj: bool, unit: bool) {
+    let n = t.r;
+    let w = b.c;
+    // The adjoint of a lower triangle is upper and the other way round.
+    let forward = lower != adj;
+    let elem = |i: usize, p: usize| -> T { if adj { t.at(p, i).conj() } else { t.at(i, p) } };
+    for s in 0..n {
+        let i = if forward { s } else { n - 1 - s };
+        if forward {
+            for p in 0..i { axpy(elem(i, p), b.d, p * w, b.d, i * w, w); }
+        } else {
+            for p in i + 1..n { axpy(elem(i, p), b.d, p * w, b.d, i * w, w); }
+        }
+        if !unit {
+            let d = elem(i, i);
+            unsafe {
+                for j in 0..w { b.d.set(i * w + j, b.d.get(i * w + j) / d); }
+            }
+        }
+    }
+}

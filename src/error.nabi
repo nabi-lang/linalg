@@ -1,0 +1,60 @@
+// The one error type of the package. Each message says what went wrong
+// and what to call instead.
+
+/// What went wrong in a linear-algebra call.
+///
+/// ```nabi
+/// use linalg::LinalgError;
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2], [2, 4]];
+/// let e = try {
+///     _ = try linalg::inv(a);
+///     LinalgError::NotFinite
+/// } catch e: LinalgError { e };
+/// assert(e == LinalgError::Singular { pivot: 1 });
+/// assert(f"{e}".contains("pinv"));
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub enum LinalgError {
+    /// A zero pivot: the matrix is singular. `pivot` is its 0-based
+    /// row.
+    Singular { pivot: usize; },
+    /// A square matrix was needed.
+    NotSquare { rows: usize; cols: usize; },
+    /// The operands' shapes do not fit; `what` names both.
+    ShapeMismatch { what: str; },
+    /// Cholesky met a leading minor that is not positive; `minor` is
+    /// its order (1-based).
+    NotPositiveDefinite { minor: usize; },
+    /// An iteration did not converge in `iterations` steps.
+    NoConvergence { iterations: usize; },
+    /// The input holds NaN or an infinity.
+    NotFinite,
+}
+
+impl Display for LinalgError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            LinalgError::Singular { pivot } => f"matrix is singular (pivot {pivot} is zero); use `lstsq` or `pinv` for a least-squares answer",
+            LinalgError::NotSquare { rows, cols } => f"expected a square matrix, got {rows} x {cols}; use `lstsq` for a non-square system, or `qr` / `svd` to factor it",
+            LinalgError::ShapeMismatch { what } => f"shapes do not fit: {what}",
+            LinalgError::NotPositiveDefinite { minor } => f"matrix is not positive definite (leading minor {minor} is not positive); use `ldlt` or `lu` for a matrix that is not",
+            LinalgError::NoConvergence { iterations } => f"no convergence after {iterations} iterations; rescale the input (entries far from 1 in magnitude) or try `svd`, which always converges for finite input",
+            LinalgError::NotFinite => "input holds NaN or infinity; replace them first (`a[f64::is_nan.(a)] = 0.0`)",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Error for LinalgError {}
+
+/// `NotSquare` unless `r == c`.
+pub(pkg) fn square(r: usize, c: usize) throws (LinalgError) {
+    if r != c { throw LinalgError::NotSquare { rows: r, cols: c }; }
+}
+
+/// `ShapeMismatch` naming `op` and both shapes.
+pub(pkg) fn mismatch(op: str, a: str, b: str, hint: str) -> LinalgError {
+    LinalgError::ShapeMismatch { what: f"{op} of {a} and {b}; {hint}" }
+}

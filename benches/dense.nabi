@@ -1,0 +1,175 @@
+// Products and factorizations of random dense f64 matrices. Throughput
+// is in flops per call, the textbook counts (Golub and Van Loan):
+// matmul 2n^3, solve 2n^3/3 + 2n^2, eigh with vectors 9n^3, SVD with
+// vectors 21n^3 (tall: 6mn^2 + 20n^3), so items/s reads as flop/s.
+
+use core::array::Array;
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn rand(m: usize, n: usize, seed: u64) -> Array<f64, 2> {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let xs: List<f64> = List::with_capacity(m * n);
+    for _ in 0..m * n { xs.push(g.uniform(-1.0, 1.0)); }
+    Array::from_list(xs, [m, n])
+}
+
+fn flops(b: Bench, f: f64) { b.set_items(f as i64); }
+
+fn matmul(b: Bench, n: usize) {
+    let x = rand(n, n, 1);
+    let y = rand(n, n, 2);
+    let nf = n as f64;
+    flops(b, 2.0 * nf * nf * nf);
+    b.iter(|| try! pkg::matmul(black_box(x), black_box(y)));
+}
+
+// Small sizes: the copies in and out of the kernels' buffers count.
+#[bench]
+fn matmul_8(b: Bench) { matmul(b, 8); }
+
+#[bench]
+fn matmul_64(b: Bench) { matmul(b, 64); }
+
+#[bench]
+fn matmul_256(b: Bench) { matmul(b, 256); }
+
+#[bench]
+fn matmul_128(b: Bench) { matmul(b, 128); }
+
+#[bench]
+fn matmul_512(b: Bench) { matmul(b, 512); }
+
+#[bench]
+fn matmul_1024(b: Bench) { matmul(b, 1024); }
+
+#[bench]
+fn matmul_2048(b: Bench) { matmul(b, 2048); }
+
+fn rect(b: Bench, m: usize, k: usize, n: usize) {
+    let x = rand(m, k, 1);
+    let y = rand(k, n, 2);
+    flops(b, 2.0 * (m as f64) * (k as f64) * (n as f64));
+    b.iter(|| try! pkg::matmul(black_box(x), black_box(y)));
+}
+
+// Tall and skinny: a thin inner dimension, then a thin output.
+#[bench]
+fn matmul_2000x16x2000(b: Bench) { rect(b, 2000, 16, 2000); }
+
+#[bench]
+fn matmul_64x4000x64(b: Bench) { rect(b, 64, 4000, 64); }
+
+#[bench]
+fn matmul_4000x64x64(b: Bench) { rect(b, 4000, 64, 64); }
+
+// The rank-32 trailing update of a blocked LU.
+#[bench]
+fn matmul_512x32x512(b: Bench) { rect(b, 512, 32, 512); }
+
+#[bench]
+fn matmul_f32_512(b: Bench) {
+    let x = rand(512, 512, 1).map(|v: f64| -> f32 { v as f32 });
+    let y = rand(512, 512, 2).map(|v: f64| -> f32 { v as f32 });
+    flops(b, 2.0 * 512.0 * 512.0 * 512.0);
+    b.iter(|| try! pkg::matmul(black_box(x), black_box(y)));
+}
+
+// LU, Cholesky and QR of 512 x 512: 2n^3/3, n^3/3 and 4n^3/3 flops.
+#[bench]
+fn lu_512(b: Bench) {
+    let a = rand(512, 512, 3);
+    flops(b, 2.0 * 512.0 * 512.0 * 512.0 / 3.0);
+    b.iter(|| try! pkg::lu(black_box(a)));
+}
+
+#[bench]
+fn cholesky_512(b: Bench) {
+    let x = rand(512, 512, 3);
+    let a = (try! pkg::matmul(x, x.t())) .+ pkg::eye::<f64>(512) .* 512.0;
+    flops(b, 512.0 * 512.0 * 512.0 / 3.0);
+    b.iter(|| try! pkg::cholesky(black_box(a)));
+}
+
+#[bench]
+fn qr_512(b: Bench) {
+    let a = rand(512, 512, 3);
+    flops(b, 4.0 * 512.0 * 512.0 * 512.0 / 3.0);
+    b.iter(|| try! pkg::qr(black_box(a)));
+}
+
+#[bench]
+fn solve_256(b: Bench) {
+    let a = rand(256, 256, 3);
+    let r = rand(256, 1, 4)[:, 0];
+    let nf = 256.0;
+    flops(b, 2.0 * nf * nf * nf / 3.0 + 2.0 * nf * nf);
+    b.iter(|| try! pkg::solve(black_box(a), black_box(r)));
+}
+
+#[bench]
+fn solve_8(b: Bench) {
+    let a = rand(8, 8, 3);
+    let r = rand(8, 1, 4)[:, 0];
+    flops(b, 2.0 * 512.0 / 3.0 + 128.0);
+    b.iter(|| try! pkg::solve(black_box(a), black_box(r)));
+}
+
+// A transposed view: the copy in walks a strided array.
+#[bench]
+fn matmul_t_256(b: Bench) {
+    let x = rand(256, 256, 1).t();
+    let y = rand(256, 256, 2);
+    flops(b, 2.0 * 256.0 * 256.0 * 256.0);
+    b.iter(|| try! pkg::matmul(black_box(x), black_box(y)));
+}
+
+// Square SVD with vectors; items are the 21n^3 of Golub-Kahan.
+#[bench]
+fn svd_128(b: Bench) {
+    let a = rand(128, 128, 5);
+    let nf = 128.0;
+    flops(b, 21.0 * nf * nf * nf);
+    b.iter(|| try! pkg::svd(black_box(a)));
+}
+
+#[bench]
+fn svd_1000(b: Bench) {
+    let a = rand(1000, 1000, 5);
+    let nf = 1000.0;
+    flops(b, 21.0 * nf * nf * nf);
+    b.iter(|| try! pkg::svd(black_box(a)));
+}
+
+// Tall thin SVDs: a QR of A, then the n x n SVD of R; items are
+// 6mn^2 + 20n^3 (R-SVD, thin U).
+#[bench]
+fn svd_10000x3(b: Bench) { tall(b, 10000, 3); }
+
+#[bench]
+fn svd_10000x50(b: Bench) { tall(b, 10000, 50); }
+
+#[bench]
+fn svdvals_1000(b: Bench) {
+    let a = rand(1000, 1000, 5);
+    let nf = 1000.0;
+    flops(b, 4.0 * nf * nf * nf);
+    b.iter(|| try! pkg::svdvals(black_box(a)));
+}
+
+fn tall(b: Bench, m: usize, n: usize) {
+    let a = rand(m, n, 5);
+    let (mf, nf) = (m as f64, n as f64);
+    flops(b, 6.0 * mf * nf * nf + 20.0 * nf * nf * nf);
+    b.iter(|| try! pkg::svd(black_box(a)));
+}
+
+#[bench]
+fn eigh_256(b: Bench) {
+    let x = rand(256, 256, 6);
+    let a = x .+ x.t();
+    let nf = 256.0;
+    flops(b, 9.0 * nf * nf * nf);
+    b.iter(|| try! pkg::eigh(black_box(a)));
+}

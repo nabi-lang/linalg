@@ -1,0 +1,129 @@
+//! The Householder QR that reduces a tall A to its n x n R, run on
+//! W = A^T (row j of W is column j of A) so every reflector, update and
+//! column norm is a contiguous loop of length m. Same steps and
+//! pivoting as `qr` (xGEQP3 norm downdating); O(2mn^2 - 2n^3/3).
+
+use pkg::Real;
+use pkg::dense::{Mat, buf};
+use pkg::factor::svd::bidiag::{apply_right, blocks, norm, reflect_row};
+use pkg::scalar::{eps, one, zero};
+use bare::mem::GcBuf;
+
+// From this many flops, the reflectors go through the rows of U^T on
+// the workers, in blocks of this many rows.
+const PAR: usize = 4194304;
+const RB: usize = 16;
+
+/// `A P = Q R` with `w` holding R (R[i, j] = w[j, i], i <= j) and the
+/// reflectors right of its diagonal, scales `tau`.
+pub(pkg) struct Reduced<T> {
+    pub(pkg) w: Mat<T>;
+    pub(pkg) tau: GcBuf<T>;
+    pub(pkg) perm: List<usize>;
+}
+
+/// Reduce `w` = A^T (n x m, n <= m) in place; column pivoting when
+/// `pivot`.
+pub(pkg) fn reduce<T: Real>(w: Mat<T>, pivot: bool) -> Reduced<T> {
+    let (n, m) = (w.r, w.c);
+    let tau: GcBuf<T> = buf(n);
+    let perm: List<usize> = List::with_capacity(n);
+    for j in 0..n { perm.push(j); }
+    let cn: GcBuf<T> = buf(n);
+    let c0: GcBuf<T> = buf(n);
+    let tol = eps::<T>().sqrt();
+    unsafe {
+        if pivot {
+            for j in 0..n {
+                cn.set(j, norm(w.d, j * m, m));
+                c0.set(j, cn.get(j));
+            }
+        }
+        for s in 0..n {
+            if pivot {
+                let p = s;
+                for j in s + 1..n {
+                    if cn.get(j) > cn.get(p) { p = j; }
+                }
+                if p != s {
+                    let (os, op) = (s * m, p * m);
+                    for i in 0..m {
+                        let t = w.d.get(os + i);
+                        w.d.set(os + i, w.d.get(op + i));
+                        w.d.set(op + i, t);
+                    }
+                    let t = perm[s];
+                    perm[s] = perm[p];
+                    perm[p] = t;
+                    let u = cn.get(s);
+                    cn.set(s, cn.get(p));
+                    cn.set(p, u);
+                    let u = c0.get(s);
+                    c0.set(s, c0.get(p));
+                    c0.set(p, u);
+                }
+            }
+            let t = if s + 1 < m { reflect_row(w, s, s) } else { zero::<T>() };
+            tau.set(s, t);
+            if t != zero::<T>() { apply_right(w, s, s, t, w, s + 1, n); }
+            if pivot {
+                for j in s + 1..n {
+                    let c = cn.get(j);
+                    if c == zero::<T>() { continue; }
+                    let r = w.at(j, s).abs() / c;
+                    let q = (one::<T>() - r * r).max(zero::<T>());
+                    let ratio = c / c0.get(j);
+                    if q * ratio * ratio <= tol {
+                        let v = norm(w.d, j * m + s + 1, m - s - 1);
+                        cn.set(j, v);
+                        c0.set(j, v);
+                    } else {
+                        cn.set(j, c * q.sqrt());
+                    }
+                }
+            }
+        }
+    }
+    Reduced { w: w, tau: tau, perm: perm }
+}
+
+impl<T: Real> Reduced<T> {
+    /// `R^T`'s rows: row j holds column j of R (n x n, zeros past the
+    /// diagonal of R).
+    pub(pkg) fn rt(self) -> Mat<T> {
+        let n = self.w.r;
+        let x: Mat<T> = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..j + 1 { x.put(j, i, self.w.at(j, i)); }
+        }
+        x
+    }
+
+    /// `(Q [top 0; 0 I])^T` (qc x m) for an n x n `top`, with no
+    /// explicit Q: the reflectors run down the rows of the result.
+    pub(pkg) fn lift_t(self, top: Mat<T>, qc: usize) -> Mat<T> {
+        let (n, m) = (self.w.r, self.w.c);
+        let ut: Mat<T> = Mat::zeros(qc, m);
+        for i in 0..n {
+            for c in 0..n { ut.put(c, i, top.at(i, c)); }
+        }
+        for c in n..qc { ut.put(c, c, one::<T>()); }
+        let (w, tau) = (self.w, self.tau);
+        if m * n * qc < PAR {
+            run(w, tau, ut, 0, qc);
+        } else {
+            par::for_each(blocks(0, qc, RB), |r0: usize| { run(w, tau, ut, r0, qc.min(r0 + RB)); });
+        }
+        ut
+    }
+}
+
+/// Rows `r0..r1` of `ut` through `H_{n-1}`, ..., `H_0`.
+fn run<T: Real>(w: Mat<T>, tau: GcBuf<T>, ut: Mat<T>, r0: usize, r1: usize) {
+    let s = w.r;
+    while s > 0 {
+        s -= 1;
+        let t = unsafe { tau.get(s) };
+        if t != zero::<T>() { apply_right(w, s, s, t, ut, r0, r1); }
+    }
+}

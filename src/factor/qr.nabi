@@ -1,0 +1,240 @@
+//! Householder QR (LAPACK's xGEQRF / xGEQP3 conventions): step k turns
+//! column k below the diagonal into zeros with H_k = I - tau v v^H,
+//! v[k] = 1, keeping v below R. Column pivoting moves the column of
+//! largest remaining norm to the front first; the norms are downdated
+//! and recomputed when cancellation makes them unreliable. Backward
+//! stable; O(2mn^2 - 2n^3/3).
+
+use pkg::blas::trsm;
+use pkg::dense::{Mat, buf};
+use pkg::scalar::{eps, one, zero};
+use pkg::{LinalgError, Rhs, Scalar};
+use bare::mem::GcBuf;
+use core::array::{Array, Matrix};
+
+/// `A P = Q R` of an m x n matrix: `Q` unitary (orthogonal for real
+/// input), `R` upper triangular, `P` a column permutation (the identity
+/// unless built with `qr_pivoted`).
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[3, 1], [4, 2]];
+/// let f = try linalg::qr(a);
+/// let r = f.r();
+/// assert((r[0, 0].abs() - 5.0).abs() < 1e-12);
+/// ```
+pub struct Qr<T> {
+    pub(pkg) f: Mat<T>;
+    pub(pkg) tau: GcBuf<T>;
+    pub(pkg) perm: List<usize>;
+}
+
+/// The 2-norm of `n` elements of `d` from `o` with stride `st`, scaled
+/// so squares cannot overflow.
+pub(pkg) fn nrm2<T: Scalar>(d: GcBuf<T>, o: usize, st: usize, n: usize) -> T::Real {
+    let zero: T::Real = num::Zero::zero();
+    let big = zero;
+    unsafe {
+        for i in 0..n {
+            let x = d.get(o + i * st).modulus();
+            if x > big { big = x; }
+        }
+        if big == zero || !big.is_finite() { return big; }
+        let s = zero;
+        for i in 0..n {
+            let x = d.get(o + i * st).scale(num::One::one() / big);
+            s = s + (x.conj() * x).re();
+        }
+        big * s.sqrt()
+    }
+}
+
+pub(pkg) fn factor<T: Scalar>(a: Matrix<T>, pivot: bool) throws (LinalgError) -> Qr<T> {
+    let f: Mat<T> = Mat::of(a);
+    if !f.finite() { throw LinalgError::NotFinite; }
+    let (m, n) = (f.r, f.c);
+    let k = m.min(n);
+    let tau: GcBuf<T> = buf(k);
+    let perm: List<usize> = List::with_capacity(n);
+    for j in 0..n { perm.push(j); }
+    let zero: T::Real = num::Zero::zero();
+    let cn: GcBuf<T::Real> = unsafe { GcBuf::new(n + 1) };
+    let c0: GcBuf<T::Real> = unsafe { GcBuf::new(n + 1) };
+    if pivot {
+        unsafe {
+            for j in 0..n {
+                cn.set(j, nrm2(f.d, j, n, m));
+                c0.set(j, cn.get(j));
+            }
+        }
+    }
+    let w: GcBuf<T> = buf(n);
+    let tol = eps::<T::Real>().sqrt();
+    for s in 0..k {
+        if pivot {
+            let p = s;
+            unsafe {
+                for j in s + 1..n {
+                    if cn.get(j) > cn.get(p) { p = j; }
+                }
+                if p != s {
+                    for i in 0..m {
+                        let t = f.at(i, s);
+                        f.put(i, s, f.at(i, p));
+                        f.put(i, p, t);
+                    }
+                    let t = perm[s];
+                    perm[s] = perm[p];
+                    perm[p] = t;
+                    let u = cn.get(s);
+                    cn.set(s, cn.get(p));
+                    cn.set(p, u);
+                    let u = c0.get(s);
+                    c0.set(s, c0.get(p));
+                    c0.set(p, u);
+                }
+            }
+        }
+        let t = reflect(f, s, s);
+        unsafe { tau.set(s, t); }
+        if t != T::zero() { apply_left(f, s, s, t.conj(), s + 1, n, w); }
+        if pivot {
+            unsafe {
+                for j in s + 1..n {
+                    let c = cn.get(j);
+                    if c == zero { continue; }
+                    let r = f.at(s, j).modulus() / c;
+                    let q = one::<T::Real>() - r * r;
+                    let q = if q < zero { zero } else { q };
+                    let ratio = c / c0.get(j);
+                    if q * ratio * ratio <= tol {
+                        let v = nrm2(f.d, (s + 1) * n + j, n, m - s - 1);
+                        cn.set(j, v);
+                        c0.set(j, v);
+                    } else {
+                        cn.set(j, c * q.sqrt());
+                    }
+                }
+            }
+        }
+    }
+    Qr { f: f, tau: tau, perm: perm }
+}
+
+/// Make the reflector of column `col` from row `row` down: store `v`
+/// (v[row] = 1 implied) below and beta on the diagonal; return tau.
+pub(pkg) fn reflect<T: Scalar>(f: Mat<T>, row: usize, col: usize) -> T {
+    let (m, n) = (f.r, f.c);
+    let alpha = f.at(row, col);
+    let xn = if row + 1 < m { nrm2(f.d, (row + 1) * n + col, n, m - row - 1) } else { zero::<T::Real>() };
+    let zero: T::Real = num::Zero::zero();
+    if xn == zero && alpha.im() == zero { return T::zero(); }
+    let mag = alpha.modulus().hypot(xn);
+    let beta = if alpha.re() >= zero { -mag } else { mag };
+    let tau = (T::from_real(beta) - alpha) / T::from_real(beta);
+    let s = T::one() / (alpha - T::from_real(beta));
+    for i in row + 1..m { f.put(i, col, f.at(i, col) * s); }
+    f.put(row, col, T::from_real(beta));
+    tau
+}
+
+/// Apply `I - t v v^H` (v in column `col` from row `row`) from the left
+/// to columns `j0..j1` of `x` (rows `row..`); `v` comes from `f`.
+/// `w` is scratch of at least `j1` elements.
+pub(pkg) fn apply_left<T: Scalar>(f: Mat<T>, row: usize, col: usize, t: T, j0: usize, j1: usize, w: GcBuf<T>) {
+    apply_to(f, row, col, t, f, j0, j1, w);
+}
+
+pub(pkg) fn apply_to<T: Scalar>(f: Mat<T>, row: usize, col: usize, t: T, x: Mat<T>, j0: usize, j1: usize, w: GcBuf<T>) {
+    let m = f.r;
+    let xc = x.c;
+    unsafe {
+        // w = v^H x, row by row so the inner loops are contiguous.
+        for j in j0..j1 { w.set(j, x.d.get(row * xc + j)); }
+        for i in row + 1..m {
+            let v = f.at(i, col).conj();
+            let o = i * xc;
+            for j in j0..j1 { w.set(j, w.get(j) + v * x.d.get(o + j)); }
+        }
+        let o = row * xc;
+        for j in j0..j1 { x.d.set(o + j, x.d.get(o + j) - t * w.get(j)); }
+        for i in row + 1..m {
+            let tv = t * f.at(i, col);
+            let o = i * xc;
+            for j in j0..j1 { x.d.set(o + j, x.d.get(o + j) - tv * w.get(j)); }
+        }
+    }
+}
+
+impl<T: Scalar> Qr<T> {
+    /// `Q`, m x qc with qc = min(m, n) (`thin`) or m.
+    pub(pkg) fn q_mat(self, full: bool) -> Mat<T> {
+        let (m, n) = (self.f.r, self.f.c);
+        let k = m.min(n);
+        let qc = if full { m } else { k };
+        let q: Mat<T> = Mat::zeros(m, qc);
+        for i in 0..qc { q.put(i, i, T::one()); }
+        let w: GcBuf<T> = buf(qc);
+        let s = k;
+        while s > 0 {
+            s -= 1;
+            let t = unsafe { self.tau.get(s) };
+            if t != T::zero() { apply_to(self.f, s, s, t, q, 0, qc, w); }
+        }
+        q
+    }
+
+    /// `Q^H b` in place (`b` has m rows).
+    pub(pkg) fn qh_apply(self, b: Mat<T>) {
+        let k = self.f.r.min(self.f.c);
+        let w: GcBuf<T> = buf(b.c);
+        for s in 0..k {
+            let t = unsafe { self.tau.get(s) };
+            if t != T::zero() { apply_to(self.f, s, s, t.conj(), b, 0, b.c, w); }
+        }
+    }
+
+    /// The thin `Q`: m x min(m, n), orthonormal columns.
+    pub fn q(self) -> Matrix<T> { self.q_mat(false).array() }
+
+    /// The full `Q`: m x m, unitary.
+    pub fn q_full(self) -> Matrix<T> { self.q_mat(true).array() }
+
+    /// `R`: min(m, n) x n, upper triangular. With pivoting its diagonal
+    /// falls in magnitude.
+    pub fn r(self) -> Matrix<T> {
+        let k = self.f.r.min(self.f.c);
+        let f = self.f;
+        Array::from_fn([k, f.c], |ix: [usize; 2]| -> T { if ix[0] <= ix[1] { f.at(ix[0], ix[1]) } else { T::zero() } })
+    }
+
+    /// The column order: column `j` of `A P` is column `perm()[j]` of `A`.
+    pub fn perm(self) -> List<usize> { self.perm.clone() }
+
+    /// The least-squares solution of `A x = b` (the exact one when A is
+    /// square), for m >= n and full column rank. Throws `Singular` when
+    /// a diagonal entry of `R` is zero; use `lstsq` for rank-deficient A.
+    pub fn solve<B: Rhs<T>>(self, b: B) throws (LinalgError) -> B {
+        let x = try self.solve_mat(Mat::of(b.matrix()));
+        b.like(x.array())
+    }
+
+    pub(pkg) fn solve_mat(self, b: Mat<T>) throws (LinalgError) -> Mat<T> {
+        let (m, n) = (self.f.r, self.f.c);
+        if b.r != m { throw pkg::error::mismatch("qr solve", f"{m} x {n}", f"{b.r} rows", "b needs one row per row of A"); }
+        if m < n { throw pkg::error::mismatch("qr solve", f"{m} x {n}", "an underdetermined system", "use `lstsq` (minimum-norm solution) for fewer rows than columns"); }
+        for i in 0..n {
+            if self.f.at(i, i) == T::zero() { throw LinalgError::Singular { pivot: i }; }
+        }
+        let y = b.copy();
+        self.qh_apply(y);
+        let top = y.sub(0, n, 0, y.c);
+        trsm(self.f.sub(0, n, 0, n), top, false, false, false);
+        let x: Mat<T> = Mat::zeros(n, b.c);
+        for i in 0..n {
+            for j in 0..b.c { x.put(self.perm[i], j, top.at(i, j)); }
+        }
+        x
+    }
+}

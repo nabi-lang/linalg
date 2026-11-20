@@ -1,0 +1,57 @@
+use pkg::tests::suite::{EPS, EPS32, close, expect, fro, orth, rand, spd, throws_kind, units};
+use core::array::{Array, Matrix, Vector};
+
+#[test]
+fn exact() {
+    let a: Matrix<f64> = [[2, -1, 0], [-1, 2, -1], [0, -1, 2]];
+    // The 1-d Laplacian: 2 - 2 cos(k pi / 4).
+    let w = (try! pkg::eigh(a)).values();
+    for k in 0usize..3 { close(w[k], 2.0 - 2.0 * ((k + 1) as f64 * f64::PI / 4.0).cos(), 4.0 * EPS, f"w{k}"); }
+    let d: Matrix<f64> = [[3, 0], [0, -1]];
+    let e = try! pkg::eigh(d);
+    expect(e.values() == Vector::<f64>::from([-1.0, 3.0]), "diagonal");
+    let v = e.vectors();
+    expect(v[0, 0] == 0.0 && v[1, 0].abs() == 1.0, "unit vectors");
+}
+
+#[test]
+fn residuals() {
+    for n in [1usize, 2, 7, 40, 100] {
+        let b = rand(n, n, n as u64 + 70);
+        let a = b .+ b.t();
+        let e = try! pkg::eigh(a);
+        let v = e.vectors();
+        let av = try! pkg::matmul(a, v);
+        let vl = v .* e.values()[none, :];
+        let r = units(av, vl, n);
+        expect(r < 8.0, f"||AV - VL|| = {r} at n = {n}");
+        expect(orth(v) < 8.0, f"orthogonality at n = {n}");
+        let w = e.values();
+        for i in 1..n { expect(w[i] >= w[i - 1], "rising"); }
+        let tr = try! pkg::trace(a);
+        close(w.sum(), tr, 1e-12 * (n as f64), "sum = trace");
+    }
+}
+
+#[test]
+fn repeated_and_types() {
+    let i: Matrix<f64> = pkg::eye(5);
+    let e = try! pkg::eigh(i .* 2.0);
+    expect(e.values() == Vector::<f64>::full([5], 2.0) && orth(e.vectors()) < 1.0, "repeated");
+    let a = spd(6, 3).map(|x: f64| -> f32 { x as f32 });
+    let f = try! pkg::eigh(a);
+    let av = try! pkg::matmul(a, f.vectors());
+    let vl = f.vectors() .* f.values()[none, :];
+    let m = 0.0f32;
+    for x in av .- vl { m = m.max(x.abs()); }
+    expect((m as f64) < 6.0 * 20.0 * EPS32, f"f32 residual {m}");
+    // Only the lower triangle is read.
+    let l: Matrix<f64> = [[2, 99], [1, 2]];
+    let w = (try! pkg::eigh(l)).values();
+    close(w[0], 1.0, 1e-15, "lower triangle");
+    let nan: Matrix<f64> = [[f64::NAN]];
+    expect(throws_kind(|| { _ = try pkg::eigh(nan); }, "NotFinite"), "nan");
+    expect(throws_kind(|| { _ = try pkg::eigh(Matrix::<f64>::zeros([2, 3])); }, "NotSquare"), "not square");
+    expect((try! pkg::eigh(Matrix::<f64>::zeros([0, 0]))).values().len() == 0, "empty");
+    let _ = fro(i);
+}

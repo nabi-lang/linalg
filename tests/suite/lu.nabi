@@ -1,0 +1,130 @@
+use pkg::tests::suite::{EPS, EPS32, close, crand, expect, fro, hilbert, rand, throws_kind, units};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+#[test]
+fn exact_small() {
+    let a: Matrix<f64> = [[2, 1, 1], [4, -6, 0], [-2, 7, 2]];
+    let b: Vector<f64> = [5, -2, 9];
+    let x = try! pkg::solve(a, b);
+    expect(x == Vector::<f64>::from([1.0, 1.0, 2.0]), f"x {x:?}");
+    close(try! pkg::det(a), -16.0, 1e-12, "det");
+    let f = try! pkg::lu(a);
+    expect(f.perm() == [1, 0, 2], f"perm {f.perm():?}");
+    let i = try! pkg::inv(a);
+    let ai = try! pkg::matmul(a, i);
+    expect(units(ai, pkg::eye::<f64>(3), 3) < 10.0, "a inv(a) = I");
+}
+
+#[test]
+fn reconstruction() {
+    for n in [1usize, 2, 5, 20, 64, 130] {
+        let a = rand(n, n, n as u64);
+        let f = try! pkg::lu(a);
+        let pa = try! pkg::matmul(f.p(), a);
+        let lu = try! pkg::matmul(f.l(), f.u());
+        let r = units(pa, lu, n);
+        expect(r < 4.0, f"||PA - LU|| = {r} n eps ||A|| at n = {n}");
+        // Partial pivoting keeps |L| <= 1.
+        for x in f.l() { expect(x.abs() <= 1.0, "|l_ij| <= 1"); }
+        let xs = rand(n, 3, 99);
+        let b = try! pkg::matmul(a, xs);
+        let x = try! f.solve(b);
+        let back = try! pkg::matmul(a, x);
+        expect(units(b, back, n) < 20.0, f"solve residual at n = {n}");
+    }
+}
+
+#[test]
+fn adjoint_solve() {
+    let a = rand(6, 6, 3);
+    let b: Vector<f64> = [1, 2, 3, 4, 5, 6];
+    let x = try! (try! pkg::lu(a)).solve_adjoint(b);
+    let back = try! pkg::matvec(a.t(), x);
+    for i in 0usize..6 { close(back[i], b[i], 1e-12, "a^T x = b"); }
+}
+
+#[test]
+fn f32_and_complex() {
+    let a = rand(8, 8, 5).map(|x: f64| -> f32 { x as f32 });
+    let f = try! pkg::lu(a);
+    let pa = try! pkg::matmul(f.p(), a);
+    let lu = try! pkg::matmul(f.l(), f.u());
+    let d = pa .- lu;
+    let m = 0.0f32;
+    for x in d { m = m.max(x.abs()); }
+    expect((m as f64) < 8.0 * 8.0 * EPS32, f"f32 residual {m}");
+
+    let z = crand(10, 10, 6);
+    let g = try! pkg::lu(z);
+    let pz = try! pkg::matmul(g.p(), z);
+    let lu = try! pkg::matmul(g.l(), g.u());
+    let r = pkg::tests::suite::cfro(pz .- lu) / (pkg::tests::suite::cfro(z) * 10.0 * EPS);
+    expect(r < 4.0, f"complex residual {r}");
+    let b: Vector<Complex<f64>> = [1.0 + 1.0i, 2.0i, 3.0 + 0.0i, 0.0i, 1.0 + 0.0i, 1.0 + 0.0i, 1.0 + 0.0i, 1.0 + 0.0i, 1.0 + 0.0i, -1.0i];
+    let x = try! g.solve(b);
+    let back = try! pkg::matvec(z, x);
+    for i in 0usize..10 { expect((back[i] - b[i]).abs() < 1e-12, "complex solve"); }
+}
+
+#[test]
+fn hilbert_tolerance() {
+    // cond(H8) is 1.5e10: about 10 of 16 digits are lost, so x = 1 comes
+    // back to about 1e-6 (measured 3e-7). The bound is cond * n * eps.
+    let n = 8usize;
+    let h = hilbert(n);
+    let ones: Vector<f64> = Array::ones([n]);
+    let b = try! pkg::matvec(h, ones);
+    let x = try! pkg::solve(h, b);
+    let c = try! pkg::cond(h);
+    close(c, 1.5257575566e10, 1e3, "cond(H8)");
+    for i in 0..n { close(x[i], 1.0, c * (n as f64) * EPS, f"x[{i}]"); }
+}
+
+#[test]
+fn errors_and_edges() {
+    let s: Matrix<f64> = [[1, 2], [2, 4]];
+    let b: Vector<f64> = [1, 2];
+    expect(throws_kind(|| { _ = try pkg::solve(s, b); }, "Singular"), "singular solve");
+    expect(throws_kind(|| { _ = try pkg::inv(s); }, "Singular"), "singular inv");
+    close(try! pkg::det(s), 0.0, 0.0, "det of singular");
+    let r: Matrix<f64> = [[1, 2, 3], [4, 5, 6]];
+    expect(throws_kind(|| { _ = try pkg::lu(r); }, "NotSquare"), "not square");
+    let three: Vector<f64> = [1, 2, 3];
+    let a: Matrix<f64> = [[1, 0], [0, 1]];
+    expect(throws_kind(|| { _ = try pkg::solve(a, three); }, "ShapeMismatch"), "rhs rows");
+    let nan: Matrix<f64> = [[1, f64::NAN], [0, 1]];
+    expect(throws_kind(|| { _ = try pkg::lu(nan); }, "NotFinite"), "nan");
+    let inf: Matrix<f64> = [[f64::INFINITY]];
+    expect(throws_kind(|| { _ = try pkg::solve(inf, Vector::<f64>::from([1.0])); }, "NotFinite"), "inf");
+    // 0 x 0: det 1, empty inverse.
+    let e: Matrix<f64> = Array::zeros([0, 0]);
+    expect(try! pkg::det(e) == 1.0, "det of 0 x 0");
+    expect((try! pkg::inv(e)).shape() == [0, 0], "inv of 0 x 0");
+    // 1 x 1.
+    let one: Matrix<f64> = [[4]];
+    expect((try! pkg::inv(one))[0, 0] == 0.25, "1 x 1 inverse");
+    // The message names the fix.
+    let msg = try { _ = try pkg::inv(s); "" } catch e { f"{e}" };
+    expect(msg.contains("lstsq"), f"message {msg}");
+}
+
+#[test]
+fn slogdet_magnitudes() {
+    let n = 200usize;
+    // det(10 I) = 10^200 overflows nothing in log form.
+    let a = pkg::eye::<f64>(n) .* 10.0;
+    let (s, l) = try! pkg::slogdet(a);
+    expect(s == 1.0, "sign");
+    close(l, (n as f64) * 10.0.ln(), 1e-10, "log det");
+    let tiny = pkg::eye::<f64>(n) .* 1e-10;
+    let (s, l) = try! pkg::slogdet(tiny);
+    expect(s == 1.0, "sign of tiny");
+    close(l, -(n as f64) * 10.0 * 10.0.ln(), 1e-9, "log det tiny");
+    let (s, l) = try! pkg::slogdet(Matrix::<f64>::from_list([1.0, 2.0, 2.0, 4.0], [2, 2]));
+    expect(s == 0.0 && l == -f64::INFINITY, "singular slogdet");
+    let neg: Matrix<f64> = [[0, 1], [1, 0]];
+    let (s, _) = try! pkg::slogdet(neg);
+    expect(s == -1.0, "a swap has sign -1");
+    let _ = fro(neg);
+}

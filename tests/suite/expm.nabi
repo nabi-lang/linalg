@@ -1,0 +1,49 @@
+use pkg::tests::suite::{close, crand, expect, fro, rand, throws_kind, units};
+use core::array::{Array, Matrix};
+use core::num::Complex;
+
+#[test]
+fn closed_forms() {
+    let z: Matrix<f64> = Array::zeros([3, 3]);
+    expect(try! pkg::expm(z) == pkg::eye::<f64>(3), "e^0 = I");
+    // Nilpotent: e^N = I + N.
+    let n: Matrix<f64> = [[0, 1], [0, 0]];
+    expect(try! pkg::expm(n) == Matrix::<f64>::from_list([1.0, 1.0, 0.0, 1.0], [2, 2]), "nilpotent");
+    for t in [0.001, 0.2, 1.0, 3.0, 25.0] {
+        let r: Matrix<f64> = [[0, t], [-t, 0]];
+        let e = try! pkg::expm(r);
+        close(e[0, 0], t.cos(), 1e-13 * t.max(1.0), f"cos {t}");
+        close(e[0, 1], t.sin(), 1e-13 * t.max(1.0), f"sin {t}");
+    }
+    let d: Matrix<f64> = [[1, 0], [0, -30]];
+    let e = try! pkg::expm(d);
+    close(e[0, 0], 1.0.exp(), 1e-15, "e^1");
+    close(e[1, 1] / (-30.0).exp(), 1.0, 1e-12, "e^-30");
+}
+
+#[test]
+fn identities() {
+    // e^A e^-A = I, and e^(2A) = (e^A)^2 across the Pade degrees.
+    for s in [0.005, 0.1, 0.5, 1.5, 6.0, 40.0] {
+        let a = rand(6, 6, 3) .* s;
+        let e = try! pkg::expm(a);
+        let f = try! pkg::expm(a .* -1.0);
+        if s <= 1.5 {
+            // Beyond that e^A e^-A cancels away the digits.
+            let p = try! pkg::matmul(e, f);
+            expect(fro(p .- pkg::eye::<f64>(6)) < 1e-12, f"e^A e^-A at scale {s}");
+        }
+        let e2 = try! pkg::expm(a .* 2.0);
+        expect(units(e2, try! pkg::matmul(e, e), 6) < 1e4 * s.max(1.0), f"e^2A at scale {s}");
+    }
+    // Complex: e^(i t I) = (cos t + i sin t) I.
+    let t = 0.7;
+    let a: Matrix<Complex<f64>> = pkg::eye::<Complex<f64>>(3) .* Complex::new(0.0, t);
+    let e = try! pkg::expm(a);
+    expect((e[1, 1] - Complex::new(t.cos(), t.sin())).abs() < 1e-15, "complex diagonal");
+    let z = crand(4, 4, 8);
+    let _ = try! pkg::expm(z);
+    expect(throws_kind(|| { _ = try pkg::expm(Matrix::<f64>::zeros([2, 3])); }, "NotSquare"), "not square");
+    let inf: Matrix<f64> = [[f64::INFINITY]];
+    expect(throws_kind(|| { _ = try pkg::expm(inf); }, "NotFinite"), "inf");
+}

@@ -1,0 +1,538 @@
+//! General real eigenproblem: Householder reduction to upper Hessenberg
+//! form (orthes), then the Francis double-shift QR iteration to real
+//! Schur form (hqr2), as in EISPACK and JAMA. Eigenvectors come from
+//! back substitution on the quasi-triangular factor. Backward stable for
+//! the Schur form; eigenvectors of ill-conditioned eigenvalues are only
+//! as good as their conditioning allows. About 25n^3 with vectors.
+
+use pkg::dense::{Mat, buf, vector};
+use pkg::error::square;
+use pkg::scalar::{eps, one, real, zero};
+use pkg::{LinalgError, Real};
+use bare::mem::GcBuf;
+use core::array::{Matrix, Vector};
+use core::num::Complex;
+
+/// The eigenvalues and eigenvectors of a real square matrix:
+/// `A v_j = w_j v_j`. Complex eigenvalues come in conjugate pairs, the
+/// one with positive imaginary part first; each vector has unit 2-norm.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let r: Matrix<f64> = [[0, -1], [1, 0]];   // a quarter turn
+/// let e = try linalg::eig(r);
+/// let w = e.values();
+/// assert(w[0].re.abs() < 1e-12 && (w[0].im - 1.0).abs() < 1e-12);
+/// ```
+pub struct Eig<T> {
+    pub(pkg) w: GcBuf<Complex<T>>;
+    pub(pkg) v: Mat<Complex<T>>;
+    pub(pkg) n: usize;
+}
+
+impl<T: Real> Eig<T> {
+    /// The eigenvalues, in the order the QR iteration finds them.
+    pub fn values(self) -> Vector<Complex<T>> { vector(self.w, self.n) }
+
+    /// The eigenvectors: column `j` belongs to `values()[j]`.
+    pub fn vectors(self) -> Matrix<Complex<T>> { self.v.array() }
+}
+
+/// The real Schur form `A = Z T Z^T`: `Z` orthogonal, `T` upper
+/// quasi-triangular with a 1 x 1 block per real eigenvalue and a 2 x 2
+/// block per complex pair.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2], [0, 3]];
+/// let s = try linalg::schur(a);
+/// assert(s.t()[1, 0] == 0.0);
+/// ```
+pub struct Schur<T> {
+    pub(pkg) t: Mat<T>;
+    pub(pkg) z: Mat<T>;
+    pub(pkg) w: GcBuf<Complex<T>>;
+}
+
+impl<T: Real> Schur<T> {
+    /// The quasi-triangular factor `T`.
+    pub fn t(self) -> Matrix<T> { self.t.array() }
+
+    /// The orthogonal factor `Z`.
+    pub fn z(self) -> Matrix<T> { self.z.array() }
+
+    /// The eigenvalues, from the diagonal blocks of `T`.
+    pub fn values(self) -> Vector<Complex<T>> { vector(self.w, self.t.r) }
+}
+
+/// `x / y` for complex `x = (xr, xi)`, `y = (yr, yi)`, scaled (Smith).
+fn cdiv<T: Real>(xr: T, xi: T, yr: T, yi: T) -> (T, T) {
+    if yr.abs() > yi.abs() {
+        let r = yi / yr;
+        let d = yr + r * yi;
+        ((xr + r * xi) / d, (xi - r * xr) / d)
+    } else {
+        let r = yr / yi;
+        let d = yi + r * yr;
+        ((r * xr + xi) / d, (r * xi - xr) / d)
+    }
+}
+
+/// Reduce `h` to Hessenberg form in place; `v` becomes the transform.
+fn orthes<T: Real>(h: Mat<T>, v: Mat<T>) {
+    let n = h.r;
+    if n < 3 { return; }
+    let high = n - 1;
+    let ort: GcBuf<T> = buf(n);
+    unsafe {
+        for m in 1..high {
+            let scale = zero::<T>();
+            for i in m..high + 1 { scale = scale + h.at(i, m - 1).abs(); }
+            if scale == zero::<T>() { continue; }
+            let hh = zero::<T>();
+            let i = high + 1;
+            while i > m {
+                i -= 1;
+                ort.set(i, h.at(i, m - 1) / scale);
+                hh = hh + ort.get(i) * ort.get(i);
+            }
+            let g = hh.sqrt();
+            if ort.get(m) > zero::<T>() { g = -g; }
+            hh = hh - ort.get(m) * g;
+            ort.set(m, ort.get(m) - g);
+            for j in m..n {
+                let f = zero::<T>();
+                for i in m..high + 1 { f = f + ort.get(i) * h.at(i, j); }
+                f = f / hh;
+                for i in m..high + 1 { h.put(i, j, h.at(i, j) - f * ort.get(i)); }
+            }
+            for i in 0..high + 1 {
+                let f = zero::<T>();
+                for j in m..high + 1 { f = f + ort.get(j) * h.at(i, j); }
+                f = f / hh;
+                for j in m..high + 1 { h.put(i, j, h.at(i, j) - f * ort.get(j)); }
+            }
+            ort.set(m, scale * ort.get(m));
+            h.put(m, m - 1, scale * g);
+        }
+        let m = high - 1;
+        while m >= 1 {
+            if h.at(m, m - 1) != zero::<T>() {
+                for i in m + 1..high + 1 { ort.set(i, h.at(i, m - 1)); }
+                for j in m..high + 1 {
+                    let g = zero::<T>();
+                    for i in m..high + 1 { g = g + ort.get(i) * v.at(i, j); }
+                    g = (g / ort.get(m)) / h.at(m, m - 1);
+                    for i in m..high + 1 { v.put(i, j, v.at(i, j) + g * ort.get(i)); }
+                }
+            }
+            m -= 1;
+        }
+    }
+}
+
+/// The double-shift QR iteration: `h` (Hessenberg) becomes the real
+/// Schur form, `v` takes the transforms, `d` / `e` the eigenvalues'
+/// real / imaginary parts. Returns the norm of the input.
+fn hqr<T: Real>(h: Mat<T>, v: Mat<T>, d: GcBuf<T>, e: GcBuf<T>) throws (LinalgError) -> T {
+    let nn = h.r;
+    let ep = eps::<T>();
+    let limit = 30 * nn + 30;
+    let total = 0usize;
+    let norm = zero::<T>();
+    for i in 0..nn {
+        let j0 = if i > 0 { i - 1 } else { 0 };
+        for j in j0..nn { norm = norm + h.at(i, j).abs(); }
+    }
+    let n: isize = nn as isize - 1;
+    let exshift = zero::<T>();
+    let (p, q, r, s, z) = (zero::<T>(), zero::<T>(), zero::<T>(), zero::<T>(), zero::<T>());
+    let (x, y, w) = (zero::<T>(), zero::<T>(), zero::<T>());
+    let iter = 0usize;
+    let half = real::<T>(0.5);
+    unsafe {
+        while n >= 0 {
+            let nu = n as usize;
+            // A single small subdiagonal element.
+            let l = nu;
+            while l > 0 {
+                s = h.at(l - 1, l - 1).abs() + h.at(l, l).abs();
+                if s == zero::<T>() { s = norm; }
+                // `<=`: an all-zero block (norm 0) deflates too.
+                if h.at(l, l - 1).abs() <= ep * s { break; }
+                l -= 1;
+            }
+            if l == nu {
+                // One root.
+                h.put(nu, nu, h.at(nu, nu) + exshift);
+                d.set(nu, h.at(nu, nu));
+                e.set(nu, zero::<T>());
+                n -= 1;
+                iter = 0;
+            } else if l + 1 == nu {
+                // Two roots.
+                w = h.at(nu, nu - 1) * h.at(nu - 1, nu);
+                p = (h.at(nu - 1, nu - 1) - h.at(nu, nu)) * half;
+                q = p * p + w;
+                z = q.abs().sqrt();
+                h.put(nu, nu, h.at(nu, nu) + exshift);
+                h.put(nu - 1, nu - 1, h.at(nu - 1, nu - 1) + exshift);
+                x = h.at(nu, nu);
+                if q >= zero::<T>() {
+                    z = if p >= zero::<T>() { p + z } else { p - z };
+                    d.set(nu - 1, x + z);
+                    d.set(nu, d.get(nu - 1));
+                    if z != zero::<T>() { d.set(nu, x - w / z); }
+                    e.set(nu - 1, zero::<T>());
+                    e.set(nu, zero::<T>());
+                    x = h.at(nu, nu - 1);
+                    s = x.abs() + z.abs();
+                    p = x / s;
+                    q = z / s;
+                    r = (p * p + q * q).sqrt();
+                    p = p / r;
+                    q = q / r;
+                    for j in nu - 1..nn {
+                        z = h.at(nu - 1, j);
+                        h.put(nu - 1, j, q * z + p * h.at(nu, j));
+                        h.put(nu, j, q * h.at(nu, j) - p * z);
+                    }
+                    for i in 0..nu + 1 {
+                        z = h.at(i, nu - 1);
+                        h.put(i, nu - 1, q * z + p * h.at(i, nu));
+                        h.put(i, nu, q * h.at(i, nu) - p * z);
+                    }
+                    for i in 0..nn {
+                        z = v.at(i, nu - 1);
+                        v.put(i, nu - 1, q * z + p * v.at(i, nu));
+                        v.put(i, nu, q * v.at(i, nu) - p * z);
+                    }
+                    // The rotation made this zero up to rounding.
+                    h.put(nu, nu - 1, zero::<T>());
+                } else {
+                    d.set(nu - 1, x + p);
+                    d.set(nu, x + p);
+                    e.set(nu - 1, z);
+                    e.set(nu, -z);
+                }
+                n -= 2;
+                iter = 0;
+            } else {
+                total += 1;
+                if total > limit { throw LinalgError::NoConvergence { iterations: limit }; }
+                // The shift.
+                x = h.at(nu, nu);
+                y = zero::<T>();
+                w = zero::<T>();
+                if l < nu {
+                    y = h.at(nu - 1, nu - 1);
+                    w = h.at(nu, nu - 1) * h.at(nu - 1, nu);
+                }
+                if iter == 10 {
+                    // Wilkinson's exceptional shift.
+                    exshift = exshift + x;
+                    for i in 0..nu + 1 { h.put(i, i, h.at(i, i) - x); }
+                    s = h.at(nu, nu - 1).abs() + h.at(nu - 1, nu - 2).abs();
+                    x = real::<T>(0.75) * s;
+                    y = x;
+                    w = real::<T>(-0.4375) * s * s;
+                }
+                if iter == 30 {
+                    // MATLAB's exceptional shift.
+                    s = (y - x) * half;
+                    s = s * s + w;
+                    if s > zero::<T>() {
+                        s = s.sqrt();
+                        if y < x { s = -s; }
+                        s = x - w / ((y - x) * half + s);
+                        for i in 0..nu + 1 { h.put(i, i, h.at(i, i) - s); }
+                        exshift = exshift + s;
+                        x = real::<T>(0.964);
+                        y = x;
+                        w = x;
+                    }
+                }
+                iter += 1;
+                // Two consecutive small subdiagonal elements.
+                let m = nu - 2;
+                loop {
+                    z = h.at(m, m);
+                    r = x - z;
+                    s = y - z;
+                    p = (r * s - w) / h.at(m + 1, m) + h.at(m, m + 1);
+                    q = h.at(m + 1, m + 1) - z - r - s;
+                    r = h.at(m + 2, m + 1);
+                    s = p.abs() + q.abs() + r.abs();
+                    p = p / s;
+                    q = q / s;
+                    r = r / s;
+                    if m == l { break; }
+                    if h.at(m, m - 1).abs() * (q.abs() + r.abs())
+                        < ep * (p.abs() * (h.at(m - 1, m - 1).abs() + z.abs() + h.at(m + 1, m + 1).abs())) {
+                            break;
+                        }
+                    m -= 1;
+                }
+                for i in m + 2..nu + 1 {
+                    h.put(i, i - 2, zero::<T>());
+                    if i > m + 2 { h.put(i, i - 3, zero::<T>()); }
+                }
+                // Double QR step on rows l..n, columns m..n.
+                for k in m..nu {
+                    let notlast = k != nu - 1;
+                    if k != m {
+                        p = h.at(k, k - 1);
+                        q = h.at(k + 1, k - 1);
+                        r = if notlast { h.at(k + 2, k - 1) } else { zero::<T>() };
+                        x = p.abs() + q.abs() + r.abs();
+                        if x == zero::<T>() { continue; }
+                        p = p / x;
+                        q = q / x;
+                        r = r / x;
+                    }
+                    s = (p * p + q * q + r * r).sqrt();
+                    if p < zero::<T>() { s = -s; }
+                    if s != zero::<T>() {
+                        if k != m {
+                            h.put(k, k - 1, -s * x);
+                        } else if l != m {
+                            h.put(k, k - 1, -h.at(k, k - 1));
+                        }
+                        p = p + s;
+                        x = p / s;
+                        y = q / s;
+                        z = r / s;
+                        q = q / p;
+                        r = r / p;
+                        for j in k..nn {
+                            p = h.at(k, j) + q * h.at(k + 1, j);
+                            if notlast {
+                                p = p + r * h.at(k + 2, j);
+                                h.put(k + 2, j, h.at(k + 2, j) - p * z);
+                            }
+                            h.put(k, j, h.at(k, j) - p * x);
+                            h.put(k + 1, j, h.at(k + 1, j) - p * y);
+                        }
+                        let top = if nu < k + 3 { nu } else { k + 3 };
+                        for i in 0..top + 1 {
+                            p = x * h.at(i, k) + y * h.at(i, k + 1);
+                            if notlast {
+                                p = p + z * h.at(i, k + 2);
+                                h.put(i, k + 2, h.at(i, k + 2) - p * r);
+                            }
+                            h.put(i, k, h.at(i, k) - p);
+                            h.put(i, k + 1, h.at(i, k + 1) - p * q);
+                        }
+                        for i in 0..nn {
+                            p = x * v.at(i, k) + y * v.at(i, k + 1);
+                            if notlast {
+                                p = p + z * v.at(i, k + 2);
+                                v.put(i, k + 2, v.at(i, k + 2) - p * r);
+                            }
+                            v.put(i, k, v.at(i, k) - p);
+                            v.put(i, k + 1, v.at(i, k + 1) - p * q);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    norm
+}
+
+/// Back substitution for the eigenvectors of the Schur form `h`, then
+/// back to `A`'s basis through `v` (both overwritten).
+fn vectors<T: Real>(h: Mat<T>, v: Mat<T>, d: GcBuf<T>, e: GcBuf<T>, norm: T) {
+    let nn = h.r;
+    if norm == zero::<T>() { return; }
+    let ep = eps::<T>();
+    let (r, s, z) = (zero::<T>(), zero::<T>(), zero::<T>());
+    unsafe {
+        let n = nn;
+        while n > 0 {
+            n -= 1;
+            let p = d.get(n);
+            let q = e.get(n);
+            if q == zero::<T>() {
+                let l = n;
+                h.put(n, n, one::<T>());
+                let i = n;
+                while i > 0 {
+                    i -= 1;
+                    let w = h.at(i, i) - p;
+                    r = zero::<T>();
+                    for j in l..n + 1 { r = r + h.at(i, j) * h.at(j, n); }
+                    if e.get(i) < zero::<T>() {
+                        z = w;
+                        s = r;
+                    } else {
+                        l = i;
+                        if e.get(i) == zero::<T>() {
+                            h.put(i, n, if w != zero::<T>() { -r / w } else { -r / (ep * norm) });
+                        } else {
+                            let x = h.at(i, i + 1);
+                            let y = h.at(i + 1, i);
+                            let qq = (d.get(i) - p) * (d.get(i) - p) + e.get(i) * e.get(i);
+                            let t = (x * s - z * r) / qq;
+                            h.put(i, n, t);
+                            h.put(i + 1, n, if x.abs() > z.abs() { (-r - w * t) / x } else { (-s - y * t) / z });
+                        }
+                        let t = h.at(i, n).abs();
+                        if (ep * t) * t > one::<T>() {
+                            for j in i..n + 1 { h.put(j, n, h.at(j, n) / t); }
+                        }
+                    }
+                }
+            } else if q < zero::<T>() {
+                let l = n - 1;
+                if h.at(n, n - 1).abs() > h.at(n - 1, n).abs() {
+                    h.put(n - 1, n - 1, q / h.at(n, n - 1));
+                    h.put(n - 1, n, -(h.at(n, n) - p) / h.at(n, n - 1));
+                } else {
+                    let (cr, ci) = cdiv(zero::<T>(), -h.at(n - 1, n), h.at(n - 1, n - 1) - p, q);
+                    h.put(n - 1, n - 1, cr);
+                    h.put(n - 1, n, ci);
+                }
+                h.put(n, n - 1, zero::<T>());
+                h.put(n, n, one::<T>());
+                let i = n - 1;
+                while i > 0 {
+                    i -= 1;
+                    let ra = zero::<T>();
+                    let sa = zero::<T>();
+                    for j in l..n + 1 {
+                        ra = ra + h.at(i, j) * h.at(j, n - 1);
+                        sa = sa + h.at(i, j) * h.at(j, n);
+                    }
+                    let w = h.at(i, i) - p;
+                    if e.get(i) < zero::<T>() {
+                        z = w;
+                        r = ra;
+                        s = sa;
+                    } else {
+                        l = i;
+                        if e.get(i) == zero::<T>() {
+                            let (cr, ci) = cdiv(-ra, -sa, w, q);
+                            h.put(i, n - 1, cr);
+                            h.put(i, n, ci);
+                        } else {
+                            let x = h.at(i, i + 1);
+                            let y = h.at(i + 1, i);
+                            let vr = (d.get(i) - p) * (d.get(i) - p) + e.get(i) * e.get(i) - q * q;
+                            let vi = (d.get(i) - p) * real::<T>(2.0) * q;
+                            if vr == zero::<T>() && vi == zero::<T>() {
+                                vr = ep * norm * (w.abs() + q.abs() + x.abs() + y.abs() + z.abs());
+                            }
+                            let (cr, ci) = cdiv(x * r - z * ra + q * sa, x * s - z * sa - q * ra, vr, vi);
+                            h.put(i, n - 1, cr);
+                            h.put(i, n, ci);
+                            if x.abs() > z.abs() + q.abs() {
+                                h.put(i + 1, n - 1, (-ra - w * h.at(i, n - 1) + q * h.at(i, n)) / x);
+                                h.put(i + 1, n, (-sa - w * h.at(i, n) - q * h.at(i, n - 1)) / x);
+                            } else {
+                                let (cr, ci) = cdiv(-r - y * h.at(i, n - 1), -s - y * h.at(i, n), z, q);
+                                h.put(i + 1, n - 1, cr);
+                                h.put(i + 1, n, ci);
+                            }
+                        }
+                        let t = h.at(i, n - 1).abs().max(h.at(i, n).abs());
+                        if (ep * t) * t > one::<T>() {
+                            for j in i..n + 1 {
+                                h.put(j, n - 1, h.at(j, n - 1) / t);
+                                h.put(j, n, h.at(j, n) / t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Back to the original basis: V = V X, X upper triangular.
+        let j = nn;
+        while j > 0 {
+            j -= 1;
+            for i in 0..nn {
+                let acc = zero::<T>();
+                for k in 0..j + 1 { acc = acc + v.at(i, k) * h.at(k, j); }
+                v.put(i, j, acc);
+            }
+        }
+    }
+}
+
+/// Hessenberg reduction plus QR iteration: (T, Z, d, e, norm of input).
+fn schur_parts<T: Real>(a: Matrix<T>) throws (LinalgError) -> (Mat<T>, Mat<T>, GcBuf<T>, GcBuf<T>, T) {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let n = s[0];
+    let h: Mat<T> = Mat::of(a);
+    if !h.finite() { throw LinalgError::NotFinite; }
+    let v: Mat<T> = Mat::eye(n);
+    let d: GcBuf<T> = buf(n);
+    let e: GcBuf<T> = buf(n);
+    orthes(h, v);
+    let norm = try hqr(h, v, d, e);
+    (h, v, d, e, norm)
+}
+
+fn values<T: Real>(d: GcBuf<T>, e: GcBuf<T>, n: usize) -> GcBuf<Complex<T>> {
+    let w: GcBuf<Complex<T>> = buf(n);
+    unsafe {
+        for i in 0..n { w.set(i, Complex::new(d.get(i), e.get(i))); }
+    }
+    w
+}
+
+pub(pkg) fn schur<T: Real>(a: Matrix<T>) throws (LinalgError) -> Schur<T> {
+    let (h, v, d, e, _) = try schur_parts(a);
+    let n = h.r;
+    // Clear what the iteration leaves below the blocks.
+    unsafe {
+        for i in 1..n {
+            for j in 0..i - 1 { h.put(i, j, zero::<T>()); }
+            if e.get(i - 1) <= zero::<T>() { h.put(i, i - 1, zero::<T>()); }
+        }
+    }
+    Schur { t: h, z: v, w: values(d, e, n) }
+}
+
+pub(pkg) fn factor<T: Real>(a: Matrix<T>) throws (LinalgError) -> Eig<T> {
+    let (h, v, d, e, norm) = try schur_parts(a);
+    let n = h.r;
+    vectors(h, v, d, e, norm);
+    let out: Mat<Complex<T>> = Mat::zeros(n, n);
+    let zr = zero::<T>();
+    let j = 0usize;
+    unsafe {
+        while j < n {
+            if e.get(j) > zr && j + 1 < n {
+                for i in 0..n {
+                    let z = Complex::new(v.at(i, j), v.at(i, j + 1));
+                    out.put(i, j, z);
+                    out.put(i, j + 1, Complex::new(z.re, -z.im));
+                }
+                j += 2;
+            } else {
+                for i in 0..n { out.put(i, j, Complex::new(v.at(i, j), zr)); }
+                j += 1;
+            }
+        }
+    }
+    // Unit 2-norm columns.
+    for c in 0..n {
+        let s = zr;
+        for i in 0..n {
+            let z = out.at(i, c);
+            s = s + z.re * z.re + z.im * z.im;
+        }
+        let s = s.sqrt();
+        if s > zr {
+            for i in 0..n {
+                let z = out.at(i, c);
+                out.put(i, c, Complex::new(z.re / s, z.im / s));
+            }
+        }
+    }
+    Eig { w: values(d, e, n), v: out, n: n }
+}

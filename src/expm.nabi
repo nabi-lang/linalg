@@ -1,0 +1,122 @@
+// The matrix exponential by scaling and squaring with Pade
+// approximants (Higham, "The scaling and squaring method for the matrix
+// exponential revisited", 2005): the degree m in {3, 5, 7, 9, 13} and the
+// scaling 2^-s are picked from ||A||_1 against Higham's theta_m, so the
+// backward error stays below unit roundoff in f64. O(n^3 (6 + s)).
+
+use pkg::blas::gemm;
+use pkg::dense::Mat;
+use pkg::error::square;
+use pkg::norm::norm1;
+use pkg::{LinalgError, Scalar};
+use core::array::Matrix;
+
+const THETA: [f64; 5] = [1.495585217958292e-2, 2.539398330063230e-1, 9.504178996162932e-1, 2.097847961257068e0, 5.371920351148152e0];
+
+const B3: [f64; 4] = [120.0, 60.0, 12.0, 1.0];
+const B5: [f64; 6] = [30240.0, 15120.0, 3360.0, 420.0, 30.0, 1.0];
+const B7: [f64; 8] = [17297280.0, 8648640.0, 1995840.0, 277200.0, 25200.0, 1512.0, 56.0, 1.0];
+const B9: [f64; 10] = [17643225600.0, 8821612800.0, 2075673600.0, 302702400.0, 30270240.0, 2162160.0, 110880.0, 3960.0, 90.0, 1.0];
+const B13: [f64; 14] = [
+    64764752532480000.0, 32382376266240000.0, 7771770303897600.0, 1187353796428800.0, 129060195264000.0,
+    10559470521600.0, 670442572800.0, 33522128640.0, 1323241920.0, 40840800.0, 960960.0, 16380.0, 182.0, 1.0,
+];
+
+/// `e^A` of a square matrix.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// // e^[[0, t], [-t, 0]] is the rotation by t.
+/// let a: Matrix<f64> = [[0, 1], [-1, 0]];
+/// let e = try linalg::expm(a);
+/// assert((e[0, 0] - 1.0.cos()).abs() < 1e-15 && (e[0, 1] - 1.0.sin()).abs() < 1e-15);
+/// ```
+pub fn expm<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Matrix<T> {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let x: Mat<T> = Mat::of(a);
+    if !x.finite() { throw LinalgError::NotFinite; }
+    let n = s[0];
+    if n == 0 { return x.array(); }
+    let nrm = norm1(x).re().to_f64();
+    let id: Mat<T> = Mat::eye(n);
+    let a2 = gemm(x, x);
+    let (u, v) = if nrm <= THETA[0] {
+        pade(x, a2, B3)
+    } else if nrm <= THETA[1] {
+        pade(x, a2, B5)
+    } else if nrm <= THETA[2] {
+        pade(x, a2, B7)
+    } else if nrm <= THETA[3] {
+        pade(x, a2, B9)
+    } else {
+        (x, id)
+    };
+    let sq = 0i32;
+    if nrm > THETA[3] {
+        // Degree 13 on A / 2^s.
+        let r = nrm / THETA[4];
+        while r > 1.0 {
+            r /= 2.0;
+            sq += 1;
+        }
+        let k = T::of(2.0 ** -sq);
+        let a1 = scaled(x, k);
+        let a2 = gemm(a1, a1);
+        let a4 = gemm(a2, a2);
+        let a6 = gemm(a4, a2);
+        let b = B13;
+        let w1 = comb([(a6, b[13]), (a4, b[11]), (a2, b[9])], none);
+        let w = comb([(gemm(a6, w1), 1.0), (a6, b[7]), (a4, b[5]), (a2, b[3])], (id, b[1]));
+        u = gemm(a1, w);
+        let z1 = comb([(a6, b[12]), (a4, b[10]), (a2, b[8])], none);
+        v = comb([(gemm(a6, z1), 1.0), (a6, b[6]), (a4, b[4]), (a2, b[2])], (id, b[0]));
+    }
+    // r = (V - U)^-1 (V + U), then squared `sq` times.
+    let p = comb([(v, 1.0), (u, 1.0)], none);
+    let q = comb([(v, 1.0), (u, -1.0)], none);
+    let r = try (try pkg::factor::lu::factor(q.array())).solve_mat(p);
+    for _ in 0..sq { r = gemm(r, r); }
+    r.array()
+}
+
+/// `(U, V)` of the degree 3..9 approximant from A and A^2.
+fn pade<T: Scalar, const K: usize>(a: Mat<T>, a2: Mat<T>, b: [f64; K]) -> (Mat<T>, Mat<T>) {
+    let n = a.r;
+    let id: Mat<T> = Mat::eye(n);
+    // Powers A^0, A^2, A^4, ...
+    let pw: List<Mat<T>> = [id, a2];
+    while pw.len() < K / 2 { pw.push(gemm(pw[pw.len() - 1], a2)); }
+    let uo: Mat<T> = Mat::zeros(n, n);
+    let ve: Mat<T> = Mat::zeros(n, n);
+    for j in 0..K / 2 {
+        axpy_mat(uo, pw[j], T::of(b[2 * j + 1]));
+        axpy_mat(ve, pw[j], T::of(b[2 * j]));
+    }
+    (gemm(a, uo), ve)
+}
+
+fn scaled<T: Scalar>(a: Mat<T>, k: T) -> Mat<T> {
+    let m = a.copy();
+    unsafe {
+        for i in 0..m.r * m.c { m.d.set(i, m.d.get(i) * k); }
+    }
+    m
+}
+
+/// `y += k x`.
+fn axpy_mat<T: Scalar>(y: Mat<T>, x: Mat<T>, k: T) {
+    unsafe {
+        for i in 0..y.r * y.c { y.d.set(i, y.d.get(i) + k * x.d.get(i)); }
+    }
+}
+
+/// `sum c_i M_i (+ c I)`.
+fn comb<T: Scalar, const K: usize>(terms: [(Mat<T>, f64); K], id: (Mat<T>, f64) | none) -> Mat<T> {
+    let n = terms[0].0.r;
+    let out: Mat<T> = Mat::zeros(n, n);
+    for k in 0..K { axpy_mat(out, terms[k].0, T::of(terms[k].1)); }
+    if let (m, c): (Mat<T>, f64) = id { axpy_mat(out, m, T::of(c)); }
+    out
+}

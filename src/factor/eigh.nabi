@@ -1,0 +1,233 @@
+//! Symmetric eigenproblem: Householder reduction to tridiagonal form
+//! (tred2), then the implicit QL algorithm with Wilkinson-like shifts
+//! (tql2), as in EISPACK and JAMA. Backward stable: the eigenvalues are
+//! exact for a matrix within n * eps * ||A|| of A. O(4n^3/3) for the
+//! reduction plus about 6n^3 for the QL sweeps with vectors.
+
+use pkg::dense::{Mat, buf, vector};
+use pkg::error::square;
+use pkg::scalar::{eps, one, real, zero};
+use pkg::{LinalgError, Real};
+use bare::mem::GcBuf;
+use core::array::{Matrix, Vector};
+
+/// `A = V diag(w) V^T` of a real symmetric matrix: eigenvalues `w`
+/// rising, orthonormal eigenvectors as the columns of `V`. Only the
+/// lower triangle of `A` is read.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[2, 1], [1, 2]];
+/// let e = try linalg::eigh(a);
+/// let w = e.values();
+/// assert((w[0] - 1.0).abs() < 1e-12 && (w[1] - 3.0).abs() < 1e-12);
+/// ```
+pub struct Eigh<T> {
+    pub(pkg) w: GcBuf<T>;
+    pub(pkg) v: Mat<T>;
+    pub(pkg) n: usize;
+}
+
+impl<T: Real> Eigh<T> {
+    /// The eigenvalues, smallest first.
+    pub fn values(self) -> Vector<T> { vector(self.w, self.n) }
+
+    /// The eigenvectors: column `j` belongs to `values()[j]`.
+    pub fn vectors(self) -> Matrix<T> { self.v.array() }
+}
+
+pub(pkg) fn factor<T: Real>(a: Matrix<T>, vectors: bool) throws (LinalgError) -> Eigh<T> {
+    let s = a.shape();
+    try square(s[0], s[1]);
+    let n = s[0];
+    let v: Mat<T> = Mat::of(a).t(false);
+    if !v.finite() { throw LinalgError::NotFinite; }
+    let d: GcBuf<T> = buf(n);
+    let e: GcBuf<T> = buf(n);
+    if n == 0 { return Eigh { w: d, v: v, n: 0 }; }
+    tred2(v, d, e);
+    // `v` is V^T: the QL rotations act on its rows.
+    let vt = v;
+    try tql2(d, e, vt, vectors);
+    Eigh { w: d, v: if vectors { vt.t(false) } else { Mat::zeros(0, 0) }, n: n }
+}
+
+/// Householder tridiagonalization. `v` holds A^T (so its upper triangle
+/// is A's lower one) and becomes V^T, the accumulated transform
+/// transposed: the inner loops then run along rows. `d` gets the
+/// diagonal, `e[1..]` the subdiagonal.
+fn tred2<T: Real>(v: Mat<T>, d: GcBuf<T>, e: GcBuf<T>) {
+    let n = v.r;
+    unsafe {
+        for j in 0..n { d.set(j, v.at(j, n - 1)); }
+        let i = n - 1;
+        while i > 0 {
+            let scale = zero::<T>();
+            let h = zero::<T>();
+            for k in 0..i { scale = scale + d.get(k).abs(); }
+            if scale == zero::<T>() {
+                e.set(i, d.get(i - 1));
+                for j in 0..i {
+                    d.set(j, v.at(j, i - 1));
+                    v.put(j, i, zero::<T>());
+                    v.put(i, j, zero::<T>());
+                }
+            } else {
+                for k in 0..i {
+                    d.set(k, d.get(k) / scale);
+                    h = h + d.get(k) * d.get(k);
+                }
+                let f = d.get(i - 1);
+                let g = h.sqrt();
+                if f > zero::<T>() { g = -g; }
+                e.set(i, scale * g);
+                h = h - f * g;
+                d.set(i - 1, f - g);
+                for j in 0..i { e.set(j, zero::<T>()); }
+                for j in 0..i {
+                    let f = d.get(j);
+                    v.put(i, j, f);
+                    let g = e.get(j) + v.at(j, j) * f;
+                    for k in j + 1..i {
+                        g = g + v.at(j, k) * d.get(k);
+                        e.set(k, e.get(k) + v.at(j, k) * f);
+                    }
+                    e.set(j, g);
+                }
+                let f = zero::<T>();
+                for j in 0..i {
+                    e.set(j, e.get(j) / h);
+                    f = f + e.get(j) * d.get(j);
+                }
+                let hh = f / (h + h);
+                for j in 0..i { e.set(j, e.get(j) - hh * d.get(j)); }
+                for j in 0..i {
+                    let f = d.get(j);
+                    let g = e.get(j);
+                    for k in j..i { v.put(j, k, v.at(j, k) - (f * e.get(k) + g * d.get(k))); }
+                    d.set(j, v.at(j, i - 1));
+                    v.put(j, i, zero::<T>());
+                }
+            }
+            d.set(i, h);
+            i -= 1;
+        }
+        // Accumulate the transforms.
+        for i in 0..n - 1 {
+            v.put(i, n - 1, v.at(i, i));
+            v.put(i, i, one::<T>());
+            let h = d.get(i + 1);
+            if h != zero::<T>() {
+                for k in 0..i + 1 { d.set(k, v.at(i + 1, k) / h); }
+                for j in 0..i + 1 {
+                    let g = zero::<T>();
+                    for k in 0..i + 1 { g = g + v.at(i + 1, k) * v.at(j, k); }
+                    for k in 0..i + 1 { v.put(j, k, v.at(j, k) - g * d.get(k)); }
+                }
+            }
+            for k in 0..i + 1 { v.put(i + 1, k, zero::<T>()); }
+        }
+        for j in 0..n {
+            d.set(j, v.at(j, n - 1));
+            v.put(j, n - 1, zero::<T>());
+        }
+        v.put(n - 1, n - 1, one::<T>());
+        e.set(0, zero::<T>());
+    }
+}
+
+/// Implicit QL on the tridiagonal (`d`, `e`); the rotations go to the
+/// rows of `vt` when `vectors`. Sorts the values rising.
+fn tql2<T: Real>(d: GcBuf<T>, e: GcBuf<T>, vt: Mat<T>, vectors: bool) throws (LinalgError) {
+    let n = vt.r;
+    let ep = eps::<T>();
+    let limit = 30 * n + 30;
+    unsafe {
+        for i in 1..n { e.set(i - 1, e.get(i)); }
+        e.set(n - 1, zero::<T>());
+        let f = zero::<T>();
+        let tst1 = zero::<T>();
+        for l in 0..n {
+            tst1 = tst1.max(d.get(l).abs() + e.get(l).abs());
+            let m = l;
+            while m < n - 1 {
+                if e.get(m).abs() <= ep * tst1 { break; }
+                m += 1;
+            }
+            if m > l {
+                let iter = 0usize;
+                loop {
+                    iter += 1;
+                    if iter > limit { throw LinalgError::NoConvergence { iterations: limit }; }
+                    let g = d.get(l);
+                    let p = (d.get(l + 1) - g) / (real::<T>(2.0) * e.get(l));
+                    let r = p.hypot(one::<T>());
+                    if p < zero::<T>() { r = -r; }
+                    d.set(l, e.get(l) / (p + r));
+                    d.set(l + 1, e.get(l) * (p + r));
+                    let dl1 = d.get(l + 1);
+                    let h = g - d.get(l);
+                    for i in l + 2..n { d.set(i, d.get(i) - h); }
+                    f = f + h;
+                    p = d.get(m);
+                    let c = one::<T>();
+                    let c2 = c;
+                    let c3 = c;
+                    let el1 = e.get(l + 1);
+                    let s = zero::<T>();
+                    let s2 = zero::<T>();
+                    let i = m;
+                    while i > l {
+                        i -= 1;
+                        c3 = c2;
+                        c2 = c;
+                        s2 = s;
+                        let g = c * e.get(i);
+                        let h = c * p;
+                        let r = p.hypot(e.get(i));
+                        e.set(i + 1, s * r);
+                        s = e.get(i) / r;
+                        c = p / r;
+                        p = c * d.get(i) - s * g;
+                        d.set(i + 1, h + s * (c * g + s * d.get(i)));
+                        if vectors {
+                            let (oi, oj) = (i * n, (i + 1) * n);
+                            for k in 0..n {
+                                let h = vt.d.get(oj + k);
+                                let x = vt.d.get(oi + k);
+                                vt.d.set(oj + k, s * x + c * h);
+                                vt.d.set(oi + k, c * x - s * h);
+                            }
+                        }
+                    }
+                    p = -s * s2 * c3 * el1 * e.get(l) / dl1;
+                    e.set(l, s * p);
+                    d.set(l, c * p);
+                    if e.get(l).abs() <= ep * tst1 { break; }
+                }
+            }
+            d.set(l, d.get(l) + f);
+            e.set(l, zero::<T>());
+        }
+        // Selection sort, rising, rows of vt along.
+        for i in 0..n {
+            let k = i;
+            let p = d.get(i);
+            for j in i + 1..n {
+                if d.get(j) < p { k = j; p = d.get(j); }
+            }
+            if k != i {
+                d.set(k, d.get(i));
+                d.set(i, p);
+                if vectors {
+                    for j in 0..n {
+                        let t = vt.at(i, j);
+                        vt.put(i, j, vt.at(k, j));
+                        vt.put(k, j, t);
+                    }
+                }
+            }
+        }
+    }
+}

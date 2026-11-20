@@ -1,0 +1,333 @@
+//! SVD of a real m x n matrix. A wide A goes through its transpose, so
+//! n = min(m, n) below. Two kernels, chosen by n alone (so
+//! `svdvals(a)` is bit for bit `svd(a).s()`):
+//!
+//! - n <= 16: one-sided Jacobi on the R of a pivoted QR (`jacobi`).
+//!   Every singular value to high relative accuracy when A is well
+//!   conditioned up to a column scaling (graded matrices): on
+//!   A = Q diag(2^-4j) it gets all twelve values, down to 2^-44, to a
+//!   few n * eps relative, where QR iteration only promises
+//!   n * eps * s_max absolute. About 3x slower, which is microseconds
+//!   at this size.
+//! - n > 16: Golub-Kahan bidiagonalization and implicit-shift QR
+//!   (`bidiag`), after a Householder QR when m >= 1.6n. Every singular
+//!   value to about n * eps * s_max absolute; on random, Hilbert and
+//!   Vandermonde matrices as accurate as Jacobi. O(mn^2) for the QR,
+//!   8n^3/3 for the bidiagonal, O(n^2) for the values alone and about
+//!   12n^3 more for the vectors, against about 4n^3 per Jacobi sweep.
+//!
+//! Both are backward stable: ||A - U S V^T|| is a small multiple of
+//! n * eps * ||A||, and U, V are orthonormal to a few n * eps. U comes
+//! from applying the reflectors to the small factor (no explicit Q).
+//! Large reflector updates and rotation sweeps run on `core::par`
+//! workers.
+
+mod bidiag;
+mod jacobi;
+mod reduce;
+
+use pkg::blas::axpy;
+use pkg::dense::{Mat, buf, vector};
+use pkg::factor::qr::{apply_to, nrm2};
+use pkg::factor::svd::bidiag::{apply_right, bdsqr, bidiagonalize, blocks};
+use pkg::factor::svd::jacobi::sweeps;
+use pkg::factor::svd::reduce::reduce;
+use pkg::scalar::{eps, one, real, zero};
+use pkg::{LinalgError, Real, Rhs, Scalar};
+use bare::mem::GcBuf;
+use core::array::{Matrix, Vector};
+
+// Largest n for the Jacobi kernel; QR iteration above.
+const JACOBI_MAX: usize = 16;
+// From this many flops, applying the reflectors to U and V^T goes to
+// the workers, in blocks of columns of U (rows of V^T) of this size.
+const PAR: usize = 4194304;
+const PB: usize = 64;
+
+/// `A = U diag(s) V^T` of a real m x n matrix: `s` falls (k = min(m, n)
+/// values), `U` and `V` have orthonormal columns. Thin by default (U is
+/// m x k, V^T k x n); `svd_full` gives the square U (m x m) and
+/// V^T (n x n).
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[3, 0], [0, -2]];
+/// let f = try linalg::svd(a);
+/// assert(f.s()[0] == 3.0 && f.s()[1] == 2.0);
+/// ```
+pub struct Svd<T> {
+    pub(pkg) u: Mat<T>;
+    pub(pkg) s: GcBuf<T>;
+    pub(pkg) vt: Mat<T>;
+    pub(pkg) k: usize;
+}
+
+/// Columns `k0..` of `u` (m x k) made orthonormal to the columns before
+/// them, from unit vectors (Gram-Schmidt, twice).
+pub(pkg) fn complete<T: Real>(u: Mat<T>, k0: usize) {
+    let (m, k) = (u.r, u.c);
+    let cand = 0usize;
+    let half = real::<T>(0.5);
+    let v: GcBuf<T> = buf(m);
+    let j = k0;
+    while j < k && cand < m {
+        unsafe {
+            for i in 0..m { v.set(i, zero::<T>()); }
+            v.set(cand, one::<T>());
+            for _ in 0..2 {
+                for c in 0..j {
+                    let h = zero::<T>();
+                    for i in 0..m { h = h + u.at(i, c) * v.get(i); }
+                    for i in 0..m { v.set(i, v.get(i) - h * u.at(i, c)); }
+                }
+            }
+        }
+        cand += 1;
+        let nv = nrm2(v, 0, 1, m);
+        if nv > half {
+            for i in 0..m { u.put(i, j, unsafe { v.get(i) } / nv); }
+            j += 1;
+        }
+    }
+}
+
+/// The SVD of `a`; `vectors = false` computes only `s`.
+pub(pkg) fn factor<T: Real>(a: Matrix<T>, full: bool, vectors: bool) throws (LinalgError) -> Svd<T> {
+    let sh = a.shape();
+    // A wide A is factored as A^T = U' S V'^T, so A = V' S U'^T.
+    let flip = sh[0] < sh[1];
+    let w = try load(a, !flip);
+    let (n, m) = (w.r, w.c);
+    let f = if n == 0 {
+        let ut: Mat<T> = if full && vectors { Mat::eye(m) } else { Mat::zeros(0, m) };
+        Tall { ut: ut, s: buf(0), vt: Mat::zeros(0, 0) }
+    } else if n <= JACOBI_MAX {
+        try by_jacobi(w, full, vectors)
+    } else {
+        try by_bidiag(w, full, vectors)
+    };
+    if !vectors {
+        return Svd { u: Mat::zeros(0, 0), s: f.s, vt: Mat::zeros(0, 0), k: n };
+    }
+    if flip { return Svd { u: f.vt.t(false), s: f.s, vt: f.ut, k: n }; }
+    Svd { u: f.ut.t(false), s: f.s, vt: f.vt, k: n }
+}
+
+/// A copy of `a`, transposed when `t`, in one pass that also checks
+/// every element is finite.
+fn load<T: Real>(a: Matrix<T>, t: bool) throws (LinalgError) -> Mat<T> {
+    let sh = a.shape();
+    let (r, c) = (sh[0], sh[1]);
+    let x: Mat<T> = if t { Mat::zeros(c, r) } else { Mat::zeros(r, c) };
+    let (i, j) = (0usize, 0usize);
+    let ok = true;
+    unsafe {
+        for v in a {
+            ok = ok && v.is_finite();
+            x.d.set(if t { j * r + i } else { i * c + j }, v);
+            j += 1;
+            if j == c {
+                j = 0;
+                i += 1;
+            }
+        }
+    }
+    if !ok { throw LinalgError::NotFinite; }
+    x
+}
+
+/// The SVD of a tall m x n matrix as `U^T` (k x m, k = n thin or m
+/// full), `s` and `V^T` (n x n).
+struct Tall<T> {
+    ut: Mat<T>;
+    s: GcBuf<T>;
+    vt: Mat<T>;
+}
+
+/// `w` = A^T (n x m), a copy the kernel may overwrite.
+fn by_jacobi<T: Real>(w: Mat<T>, full: bool, vectors: bool) throws (LinalgError) -> Tall<T> {
+    let (n, m) = (w.r, w.c);
+    let f = reduce(w, true);
+    // Rows of `c` are the columns of R.
+    let c = f.rt();
+    let v: Mat<T> = if vectors { Mat::<T>::eye(n) } else { Mat::zeros(0, 0) };
+    try sweeps(c, v, vectors);
+    let sv: GcBuf<T> = buf(n);
+    unsafe {
+        for i in 0..n { sv.set(i, nrm2(c.d, i * n, 1, n)); }
+    }
+    let order = falling(sv, n);
+    let s = pick(sv, order);
+    if !vectors { return Tall { ut: Mat::zeros(0, 0), s: s, vt: Mat::zeros(0, 0) }; }
+    // U_R (n x n): column i is row order[i] of c over its norm.
+    let ur: Mat<T> = Mat::zeros(n, n);
+    let good = 0usize;
+    for i in 0..n {
+        let si = unsafe { s.get(i) };
+        if si > zero::<T>() {
+            good = i + 1;
+            for r in 0..n { ur.put(r, i, c.at(order[i], r) / si); }
+        }
+    }
+    complete(ur, good);
+    let ut = f.lift_t(ur, if full { m } else { n });
+    // V^T = (sorted rows of the rotations) P^T.
+    let vtp: Mat<T> = Mat::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n { vtp.put(i, f.perm[j], v.at(order[i], j)); }
+    }
+    Tall { ut: ut, s: s, vt: vtp }
+}
+
+/// `w` = A^T (n x m), a copy the kernel may overwrite.
+fn by_bidiag<T: Real>(w: Mat<T>, full: bool, vectors: bool) throws (LinalgError) -> Tall<T> {
+    let (n, m) = (w.r, w.c);
+    // Past m = 1.6n the QR's 2mn^2 is cheaper than bidiagonalizing the
+    // whole of A (LAPACK's crossover).
+    let pre = 5 * m >= 8 * n;
+    let qf = reduce(if pre { w } else { Mat::zeros(0, 0) }, false);
+    let a: Mat<T> = if pre { qf.rt().t(false) } else { w.t(false) };
+    let b = bidiagonalize(a);
+    let xt: Mat<T> = if vectors { Mat::eye(n) } else { Mat::zeros(0, 0) };
+    let yt: Mat<T> = if vectors { Mat::eye(n) } else { Mat::zeros(0, 0) };
+    try bdsqr(b.d, b.e, n, xt, yt, vectors);
+    let order = falling(b.d, n);
+    let s = pick(b.d, order);
+    if !vectors { return Tall { ut: Mat::zeros(0, 0), s: s, vt: Mat::zeros(0, 0) }; }
+    // V^T = Y^T P^T, P^T = H_{n-2} ... H_0.
+    let vt: Mat<T> = Mat::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n { vt.put(i, j, yt.at(order[i], j)); }
+    }
+    if n * n * n < PAR {
+        right(b.f, b.tr, vt, 0, n);
+    } else {
+        par::for_each(blocks(0, n, PB), |r0: usize| { right(b.f, b.tr, vt, r0, n.min(r0 + PB)); });
+    }
+    // U = Q_B X, then through the QR's Q when A was reduced first.
+    let xs: Mat<T> = Mat::zeros(n, n);
+    for i in 0..n {
+        for r in 0..n { xs.put(r, i, xt.at(order[i], r)); }
+    }
+    let qc = if full { m } else { n };
+    if pre { return Tall { ut: qf.lift_t(lift(b.f, b.tl, xs, n), qc), s: s, vt: vt }; }
+    Tall { ut: lift(b.f, b.tl, xs, qc).t(false), s: s, vt: vt }
+}
+
+/// The indices of the first `n` values of `v`, largest value first.
+fn falling<T: Real>(v: GcBuf<T>, n: usize) -> List<usize> {
+    let order: List<usize> = List::with_capacity(n);
+    for i in 0..n { order.push(i); }
+    order.sort_by(|a, b| unsafe { v.get(b).total_cmp(v.get(a)) });
+    order
+}
+
+fn pick<T: Real>(v: GcBuf<T>, order: List<usize>) -> GcBuf<T> {
+    let n = order.len();
+    let s: GcBuf<T> = buf(n);
+    for i in 0..n { unsafe { s.set(i, v.get(order[i])); } }
+    s
+}
+
+/// `H_0 ... H_{k-1} [top 0; 0 I]` (f.r x qc), the reflectors in the
+/// columns of `f` below the diagonal with scales `tau`; O(4 f.r k qc),
+/// no explicit Q.
+fn lift<T: Real>(f: Mat<T>, tau: GcBuf<T>, top: Mat<T>, qc: usize) -> Mat<T> {
+    let m = f.r;
+    let u: Mat<T> = Mat::zeros(m, qc);
+    for i in 0..top.r {
+        for j in 0..top.c { u.put(i, j, top.at(i, j)); }
+    }
+    for c in top.c..qc { u.put(c, c, one::<T>()); }
+    let w: GcBuf<T> = buf(qc);
+    // Columns of U are independent: a worker takes a block through
+    // every reflector.
+    if m * f.c * qc < PAR || qc <= PB {
+        left(f, tau, u, w, 0, qc);
+    } else {
+        par::for_each(blocks(0, qc, PB), |j0: usize| { left(f, tau, u, w, j0, qc.min(j0 + PB)); });
+    }
+    u
+}
+
+/// Columns `j0..j1` of `u` through `H_{k-1}`, ..., `H_0` (`w` scratch,
+/// indexed by column).
+fn left<T: Real>(f: Mat<T>, tau: GcBuf<T>, u: Mat<T>, w: GcBuf<T>, j0: usize, j1: usize) {
+    let s = f.r.min(f.c);
+    while s > 0 {
+        s -= 1;
+        let t = unsafe { tau.get(s) };
+        if t != zero::<T>() { apply_to(f, s, s, t, u, j0, j1, w); }
+    }
+}
+
+/// Rows `r0..r1` of `vt` through the right reflectors `H_{n-2}`, ...,
+/// `H_0` of a bidiagonalization (`f` n columns, scales `tr`).
+fn right<T: Real>(f: Mat<T>, tr: GcBuf<T>, vt: Mat<T>, r0: usize, r1: usize) {
+    let k = f.c - 1;
+    while k > 0 {
+        k -= 1;
+        let t = unsafe { tr.get(k) };
+        if t != zero::<T>() { apply_right(f, k, k + 1, t, vt, r0, r1); }
+    }
+}
+
+impl<T: Real> Svd<T> {
+    /// `U`: m x k (thin) or m x m (full).
+    pub fn u(self) -> Matrix<T> { self.u.array() }
+
+    /// The singular values, largest first.
+    pub fn s(self) -> Vector<T> { vector(self.s, self.k) }
+
+    /// `V^T`: k x n (thin) or n x n (full).
+    pub fn vt(self) -> Matrix<T> { self.vt.array() }
+
+    /// `V`, the transpose of `vt()`.
+    pub fn v(self) -> Matrix<T> { self.vt.t(false).array() }
+
+    /// How many singular values exceed `tol` (`none`: the default
+    /// max(m, n) * eps * s[0]).
+    pub fn rank(self, tol: T | none) -> usize {
+        let t = tol ?? self.default_tol();
+        let r = 0usize;
+        for i in 0..self.k {
+            if unsafe { self.s.get(i) } > t { r += 1; }
+        }
+        r
+    }
+
+    pub(pkg) fn default_tol(self) -> T {
+        if self.k == 0 { return zero::<T>(); }
+        let dim = self.u.r.max(self.vt.c);
+        real::<T>(dim as f64) * eps::<T>() * unsafe { self.s.get(0) }
+    }
+
+    /// The minimum-norm least-squares solution `V S^+ U^T b`, singular
+    /// values at or below `tol` (`none`: the default of `rank`) taken
+    /// as zero.
+    pub fn solve<B: Rhs<T>>(self, b: B, tol: T | none) throws (LinalgError) -> B {
+        let x = try self.solve_mat(Mat::of(b.matrix()), tol);
+        b.like(x.array())
+    }
+
+    pub(pkg) fn solve_mat(self, b: Mat<T>, tol: T | none) throws (LinalgError) -> Mat<T> {
+        let (m, n) = (self.u.r, self.vt.c);
+        if b.r != m { throw pkg::error::mismatch("lstsq", f"{m} x {n}", f"{b.r} rows", "b needs one row per row of A"); }
+        let r = self.rank(tol);
+        let w = b.c;
+        let x: Mat<T> = Mat::zeros(n, w);
+        let y: GcBuf<T> = buf(w);
+        for i in 0..r {
+            let si = unsafe { self.s.get(i) };
+            // y = (u_i^T b) / s_i, then x += v_i y.
+            unsafe {
+                for j in 0..w { y.set(j, zero::<T>()); }
+                for p in 0..m { axpy(-self.u.at(p, i), b.d, p * w, y, 0, w); }
+                for j in 0..w { y.set(j, y.get(j) / si); }
+            }
+            for q in 0..n { axpy(-self.vt.at(i, q), y, 0, x.d, q * w, w); }
+        }
+        x
+    }
+}

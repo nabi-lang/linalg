@@ -1,0 +1,70 @@
+//! One-sided Jacobi (Hestenes) on the columns of a pivoted R (Drmac
+//! and Veselic): plane rotations orthogonalize the columns until every
+//! pair is orthogonal to working precision; the column norms are the
+//! singular values. Converges quadratically, rarely past 10 sweeps of
+//! about 4n^3 each; the small singular values come out to high relative
+//! accuracy when A is well conditioned up to a column scaling.
+
+use pkg::LinalgError;
+use pkg::Real;
+use pkg::blas::dot;
+use pkg::dense::{Mat, buf};
+use pkg::scalar::{eps, one, real, zero};
+use bare::mem::GcBuf;
+
+const MAX_SWEEPS: usize = 60;
+
+/// The sweeps over the rows of `w` (n rows of length m, the columns
+/// being orthogonalized); `vt` (n x n) takes the same rotations when
+/// `vectors`.
+pub(pkg) fn sweeps<T: Real>(w: Mat<T>, vt: Mat<T>, vectors: bool) throws (LinalgError) {
+    let (n, m) = (w.r, w.c);
+    let tol = eps::<T>() * real::<T>(n as f64).sqrt();
+    let two = real::<T>(2.0);
+    // Squared row norms, updated through each rotation (Rutishauser:
+    // a' = a - t g, b' = b + t g) and recomputed every sweep.
+    let nr: GcBuf<T> = buf(n);
+    for _ in 0..MAX_SWEEPS {
+        unsafe {
+            for i in 0..n { nr.set(i, dot(w.d, i * m, w.d, i * m, m)); }
+        }
+        let rotated = false;
+        for p in 0..n {
+            for q in p + 1..n {
+                let a = unsafe { nr.get(p) };
+                let b = unsafe { nr.get(q) };
+                if a == zero::<T>() || b == zero::<T>() { continue; }
+                let g = dot(w.d, p * m, w.d, q * m, m);
+                if g.abs() <= tol * a.sqrt() * b.sqrt() { continue; }
+                rotated = true;
+                let zeta = (b - a) / (two * g);
+                let t = one::<T>() / (zeta.abs() + one::<T>().hypot(zeta));
+                let t = if zeta < zero::<T>() { -t } else { t };
+                let c = one::<T>() / one::<T>().hypot(t);
+                let s = c * t;
+                rotate(w, p, q, c, s);
+                if vectors { rotate(vt, p, q, c, s); }
+                unsafe {
+                    nr.set(p, (a - t * g).max(zero::<T>()));
+                    nr.set(q, b + t * g);
+                }
+            }
+        }
+        if !rotated { return; }
+    }
+    throw LinalgError::NoConvergence { iterations: MAX_SWEEPS };
+}
+
+/// Rows `p`, `q` of `x` become `c x_p - s x_q`, `s x_p + c x_q`.
+fn rotate<T: Real>(x: Mat<T>, p: usize, q: usize, c: T, s: T) {
+    let n = x.c;
+    let (op, oq) = (p * n, q * n);
+    unsafe {
+        for j in 0..n {
+            let xp = x.d.get(op + j);
+            let xq = x.d.get(oq + j);
+            x.d.set(op + j, c * xp - s * xq);
+            x.d.set(oq + j, s * xp + c * xq);
+        }
+    }
+}

@@ -1,0 +1,97 @@
+use pkg::ops::MatMul;
+use pkg::tests::suite::{close, expect, fro, rand};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+#[test]
+fn matmul_operator() {
+    let a = rand(4, 3, 1);
+    let b = rand(3, 5, 2);
+    let c = rand(5, 2, 3);
+    expect(a ⊡ b == try! pkg::matmul(a, b), "a ⊡ b");
+    // Left to right, like `*`.
+    expect(fro((a ⊡ b ⊡ c) .- ((a ⊡ b) ⊡ c)) == 0.0, "left associative");
+    // Binds tighter than `.+`, looser than postfix `†`.
+    let s = a ⊡ b .+ 1.0;
+    expect(s == (try! pkg::matmul(a, b)) .+ 1.0, "a ⊡ b .+ 1");
+    let g = a† ⊡ a;
+    expect(g == try! pkg::matmul(a.t(), a), "a† ⊡ a");
+    // Scalars: `2.0 .* a ⊡ b` is `(2 a) ⊡ b` since `.*` and `⊡` share a level.
+    let t = 2.0 .* a ⊡ b;
+    expect(fro(t .- (try! pkg::matmul(a, b)) .* 2.0) < 1e-15, "2 .* a ⊡ b");
+    let x: Vector<f64> = [1, 2, 3];
+    expect(a ⊡ x == try! pkg::matvec(a, x), "matrix ⊡ vector");
+    let y: Vector<f64> = [1, 0, 0, 1];
+    expect(y ⊡ a == try! pkg::vecmat(y, a), "vector ⊡ matrix");
+    expect(x ⊡ x == 14.0, "vector ⊡ vector");
+    // The named form of the same trait method.
+    expect(a.matmul(b) == a ⊡ b, "method form");
+}
+
+#[test]
+fn ascii_spellings() {
+    let a = rand(4, 3, 4);
+    let b = rand(3, 5, 5);
+    let c = rand(5, 2, 6);
+    expect(a @ b == a ⊡ b, "a @ b");
+    expect(a @ b @ c == (a ⊡ b) ⊡ c, "left associative");
+    // Mixed spellings share the level of `*`.
+    expect(a @ b ⊡ c == (a @ b) @ c, "a @ b ⊡ c");
+    let s = a @ b .+ 1.0;
+    expect(s == (a ⊡ b) .+ 1.0, "a @ b .+ 1");
+    expect(a† @ a == a† ⊡ a, "a† @ a");
+    let m: Matrix<f64> = [[4, 1], [1, 3]];
+    let r: Vector<f64> = [1, 2];
+    let x = try! (m \ r).get();
+    expect(x == try! (m ⧵ r).get(), "m \\ r");
+    close((m @ x)[1], 2.0, 1e-15, "m @ (m \\ r)");
+    let i = try! (m \ m).get();
+    expect(fro(i .- pkg::eye::<f64>(2)) < 1e-15, "m \\ m");
+    let q: Matrix<f64> = [[1, 2], [2, 4]];
+    expect((q \ r).is_err(), "singular \\");
+}
+
+#[test]
+fn kron_solve_adjoint() {
+    let i: Matrix<f64> = pkg::eye(2);
+    let b: Matrix<f64> = [[1, 2], [3, 4]];
+    expect(i ⊗ b == pkg::kron(i, b), "kron");
+    let u: Vector<f64> = [1, 2];
+    let v: Vector<f64> = [3, 4, 5];
+    expect(u ⊗ v == pkg::outer(u, v), "outer");
+    // `⊗` and `⊡` share the level of `*`: (I ⊗ B) ⊡ (I ⊗ B).
+    let k = i ⊗ b ⊡ (i ⊗ b);
+    expect(k == pkg::kron(i, try! pkg::matmul(b, b)), "(I x B)(I x B) = I x B^2");
+    let a: Matrix<f64> = [[4, 1], [1, 3]];
+    let rhs: Vector<f64> = [1, 2];
+    let x = try! (a ⧵ rhs).get();
+    let back = a ⊡ x;
+    close(back[0], 1.0, 1e-15, "a ⧵ b");
+    close(back[1], 2.0, 1e-15, "a ⧵ b");
+    // Non-square: least squares.
+    let tall: Matrix<f64> = [[1, 0], [0, 1], [1, 1]];
+    let fit = try! (tall ⧵ Vector::<f64>::from([1.0, 1.0, 2.0])).get();
+    close(fit[0], 1.0, 1e-14, "tall ⧵ b");
+    // Singular: an error value, not a panic.
+    let s: Matrix<f64> = [[1, 2], [2, 4]];
+    let r = s ⧵ rhs;
+    expect(r.is_err(), "singular ⧵");
+    expect(r.err() == pkg::LinalgError::Singular { pivot: 1 }, f"{r.err():?}");
+    // Matrix right-hand side; `⧵` binds like `/`.
+    let xs = try! (a ⧵ pkg::eye::<f64>(2)).get();
+    expect(fro((a ⊡ xs) .- pkg::eye::<f64>(2)) < 1e-15, "a ⧵ I");
+    let z: Matrix<Complex<f64>> = [[1.0 + 2.0i, 3.0 + 0.0i], [0.0i, -1.0i]];
+    let h = z†;
+    expect(h[0, 1] == Complex::new(0.0, 0.0) && h[1, 0] == Complex::new(3.0, 0.0) && h[1, 1] == Complex::new(0.0, 1.0), "adjoint");
+    expect(z† ⊡ z == try! pkg::matmul(pkg::adjoint(z), z), "z† ⊡ z");
+}
+
+#[test]
+fn macro_rows() {
+    let a = mat![1, 2, 3; 4, 5, 6.5];
+    expect(a.shape() == [2, 3] && a[1, 2] == 6.5 && a[0, 0] == 1.0, f"{a:?}");
+    let one = mat![7];
+    expect(one.shape() == [1, 1], "1 x 1");
+    let e = mat![1 + 1, 2 * 3; -1, 0];
+    expect(e == Matrix::<f64>::from_list([2.0, 6.0, -1.0, 0.0], [2, 2]), "expressions");
+}

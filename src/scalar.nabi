@@ -1,0 +1,109 @@
+//! Element types: `Scalar` is what every routine needs (f32, f64 and
+//! their complex forms), `Real` adds ordering and the float functions
+//! for the iterative routines (SVD, eigen) and for norms.
+
+use core::num::{Complex, FloatingPoint};
+
+/// An element type the routines accept: `f32`, `f64`, `Complex<f32>`,
+/// `Complex<f64>`. `Real` is the type of a modulus or a norm.
+///
+/// ```nabi
+/// use linalg::Scalar;
+/// use core::num::Complex;
+///
+/// let z = 3.0 + 4.0i;
+/// assert(z.modulus() == 5.0);
+/// assert(z.conj() == Complex::new(3.0, -4.0));
+/// ```
+pub trait Scalar: Copy + num::Zero + num::One + ops::Add<Output = Self> + ops::Sub<Output = Self>
+    + ops::Mul<Output = Self> + ops::Div<Output = Self> + ops::Neg<Output = Self> + PartialEq + Debug + Send + Sync {
+        type Real: Real;
+        /// `true` for the complex types.
+        const COMPLEX: bool;
+        /// The complex conjugate (the value itself for a real type).
+        fn conj(self) -> Self;
+        /// The real part.
+        fn re(self) -> Self::Real;
+        /// The imaginary part (0 for a real type).
+        fn im(self) -> Self::Real;
+        /// `|x|`, without overflow for complex values.
+        fn modulus(self) -> Self::Real;
+        /// `|re| + |im|`, a cheap modulus for pivot searches.
+        fn abs1(self) -> Self::Real;
+        /// `r` as this type.
+        fn from_real(r: Self::Real) -> Self;
+        /// `self * r` for a real `r`.
+        fn scale(self, r: Self::Real) -> Self;
+        /// The principal square root.
+        fn root(self) -> Self;
+        /// `true` unless a part is NaN or infinite.
+        fn finite(self) -> bool;
+        /// `x` rounded to this type.
+        fn of(x: f64) -> Self;
+    }
+
+/// A real element type, `f32` or `f64`: what the SVD and the
+/// eigensolvers take, and the type of every norm.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// fn top<T: linalg::Real>(a: Matrix<T>) -> T { (try! linalg::svdvals(a))[0] }
+///
+/// let a: Matrix<f32> = [[3, 0], [0, 1]];
+/// assert(top(a) == 3.0f32);
+/// ```
+pub trait Real: Scalar<Real = Self> + FloatingPoint {}
+
+#[impl_macro(real_scalar)] @macro {
+    (@rep[sep = ","] { @t: ty }) => {
+        @for @t {
+            impl Scalar for @t {
+                type Real = @t;
+                const COMPLEX: bool = false;
+                fn conj(self) -> @t { self }
+                fn re(self) -> @t { self }
+                fn im(self) -> @t { 0.0 }
+                fn modulus(self) -> @t { self.abs() }
+                fn abs1(self) -> @t { self.abs() }
+                fn from_real(r: @t) -> @t { r }
+                fn scale(self, r: @t) -> @t { self * r }
+                fn root(self) -> @t { self.sqrt() }
+                fn finite(self) -> bool { self.is_finite() }
+                fn of(x: f64) -> @t { x as @t }
+            }
+
+            impl Real for @t {}
+
+            impl Scalar for Complex<@t> {
+                type Real = @t;
+                const COMPLEX: bool = true;
+                fn conj(self) -> Complex<@t> { Complex::new(self.re, -self.im) }
+                fn re(self) -> @t { self.re }
+                fn im(self) -> @t { self.im }
+                fn modulus(self) -> @t { self.re.hypot(self.im) }
+                fn abs1(self) -> @t { self.re.abs() + self.im.abs() }
+                fn from_real(r: @t) -> Complex<@t> { Complex::new(r, 0.0) }
+                fn scale(self, r: @t) -> Complex<@t> { Complex::new(self.re * r, self.im * r) }
+                fn root(self) -> Complex<@t> { self.sqrt() }
+                fn finite(self) -> bool { self.re.is_finite() && self.im.is_finite() }
+                fn of(x: f64) -> Complex<@t> { Complex::new(x as @t, 0.0) }
+            }
+        }
+    }
+}
+
+real_scalar!(f32, f64);
+
+// Constants of a real type, for generic code: `T::Real::EPSILON` does
+// not resolve through the projection, `eps::<T::Real>()` does.
+
+pub(pkg) fn zero<R: Real>() -> R { num::Zero::zero() }
+
+pub(pkg) fn one<R: Real>() -> R { num::One::one() }
+
+pub(pkg) fn eps<R: Real>() -> R { R::EPSILON }
+
+pub(pkg) fn real<R: Real>(x: f64) -> R { R::of(x) }
+
+pub(pkg) fn inf<R: Real>() -> R { R::INFINITY }
