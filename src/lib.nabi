@@ -10,6 +10,190 @@
 //!
 //! Pure Nabi: no BLAS or LAPACK, so every target, wasm included, gets
 //! the same results.
+//!
+//! ## Tutorial
+//!
+//! Most numerical work comes down to matrices: a system of equations, a
+//! least-squares fit, the modes of a structure. `linalg` handles dense
+//! matrices; [`sparse`](https://packages.nabi-lang.org/docs/sparse/latest)
+//! handles the large ones that are mostly zeros. Both work on core's
+//! `Matrix<f64>` and `Vector<f64>` ([Arrays and
+//! numerics](https://docs.nabi-lang.org/latest/learn/21-arrays-and-numerics.html)),
+//! so their results feed straight into everything else.
+//!
+//! ### Matrices and vectors
+//!
+//! A `Matrix<f64>` is a two-dimensional array; write one as nested lists
+//! with the type given. With the `ops` feature (on by default), `@` is the
+//! matrix product, `\` solves and `†` is the transpose (the conjugate
+//! transpose for complex matrices). The dot operators (`.+`, `.*`) work
+//! element by element, as in core.
+//!
+//! ```nabi
+//! use core::array::{Matrix, Vector};
+//! use linalg::ops::*;
+//!
+//! let a: Matrix<f64> = [[2, 1], [1, 3]];
+//! let v: Vector<f64> = [1, 2];
+//! println(a @ v);
+//! println(a† @ a);
+//! println(a .* 10.0);
+//! println(linalg::eye::<f64>(2));
+//! # assert((a @ v).to_list() == [4.0, 7.0]);
+//! # assert((a† @ a)[1, 1] == 10.0);
+//! ```
+//!
+//! ```text
+//! [4.0, 7.0]
+//! [[5.0, 5.0], [5.0, 10.0]]
+//! [[20.0, 10.0], [10.0, 30.0]]
+//! [[1.0, 0.0], [0.0, 1.0]]
+//! ```
+//!
+//! `a @ v` panics when the shapes do not fit, the way `.+` does;
+//! `linalg::matmul(a, b)` is the same product as a call that throws a
+//! `LinalgError` instead.
+//!
+//! ### Solve a system
+//!
+//! Three unknowns, three equations: `a x = b`. `linalg::solve` factors `a`
+//! (LU with partial pivoting) and solves; `a \ b` is the same as an
+//! operator, returning a result to unwrap with `get`. The residual
+//! `a x - b` shows how close the answer is.
+//!
+//! ```nabi
+//! use core::array::{Matrix, Vector};
+//! use linalg::ops::*;
+//!
+//! let a: Matrix<f64> = [[4, 1, 0], [1, 3, 1], [0, 1, 2]];
+//! let b: Vector<f64> = [1, 2, 3];
+//!
+//! let x = try linalg::solve(a, b);
+//! println(f"x = {x:.4}");
+//! println(f"residual {linalg::norm(a @ x .- b) < 1e-12}");
+//!
+//! let same = try (a \ b).get();
+//! println(same.all_close(x));
+//! # assert((x[0] - 2.0 / 9.0).abs() < 1e-12 && (x[2] - 13.0 / 9.0).abs() < 1e-12);
+//! # assert(same.all_close(x));
+//! ```
+//!
+//! ```text
+//! x = [0.2222, 0.1111, 1.4444]
+//! residual true
+//! true
+//! ```
+//!
+//! To solve with the same matrix many times, factor it once:
+//! `linalg::lu(a)` (any square matrix) or `linalg::cholesky(a)` (symmetric
+//! positive definite, twice as fast) return a factorization with `solve`,
+//! `det` and `inv`.
+//!
+//! ```nabi
+//! use core::array::{Matrix, Vector};
+//!
+//! let a: Matrix<f64> = [[4, 1, 0], [1, 3, 1], [0, 1, 2]];
+//! let c = try linalg::cholesky(a);
+//! let rhs: List<Vector<f64>> = [[1, 0, 0], [0, 1, 0]];
+//! for b in rhs {
+//!     println(f"{try c.solve(b):.4}");
+//! }
+//! println(f"det {(try linalg::lu(a)).det():.1}");
+//! # assert(((try c.solve([1.0, 0.0, 0.0]))[0] - 5.0 / 18.0).abs() < 1e-12);
+//! # assert(((try linalg::lu(a)).det() - 18.0).abs() < 1e-9);
+//! ```
+//!
+//! ```text
+//! [0.2778, -0.1111, 0.0556]
+//! [-0.1111, 0.4444, -0.2222]
+//! det 18.0
+//! ```
+//!
+//! ### Fit a line by least squares
+//!
+//! More equations than unknowns: there is no exact solution, so least
+//! squares finds the one that makes the squared residuals smallest. For a
+//! line `y = c0 + c1 t`, each data point is a row `[1, t]`. `linalg::lstsq`
+//! solves it through a QR factorization, which keeps its accuracy where the
+//! normal equations `aᵀa x = aᵀy` lose digits.
+//!
+//! ```nabi
+//! use core::array::{Matrix, Vector};
+//!
+//! let t: Vector<f64> = [0, 1, 2, 3, 4];
+//! let y: Vector<f64> = [1.1, 2.9, 5.2, 7.1, 8.8];
+//! let a: Matrix<f64> = Matrix::from_fn([5, 2], |i: [usize; 2]| -> f64 { if i[1] == 0 { 1.0 } else { t[i[0]] } });
+//!
+//! let c = try linalg::lstsq(a, y);
+//! println(f"y = {c[0]:.3} + {c[1]:.3} t");
+//! # assert((c[0] - 1.1).abs() < 1e-9 && (c[1] - 1.96).abs() < 1e-9);
+//! ```
+//!
+//! ```text
+//! y = 1.100 + 1.960 t
+//! ```
+//!
+//! `stats::ols` does the same fit and adds standard errors and p-values for
+//! each coefficient
+//! ([`stats`](https://packages.nabi-lang.org/docs/stats/latest)).
+//!
+//! ### Eigenvalues and the SVD
+//!
+//! `linalg::eigh` takes a symmetric matrix and returns its eigenvalues in
+//! rising order with orthonormal eigenvectors as columns. Here it finds the
+//! natural frequencies of three masses on springs: the eigenvalues of the
+//! stiffness matrix are the squared frequencies.
+//!
+//! ```nabi
+//! use core::array::Matrix;
+//!
+//! let k: Matrix<f64> = [[2, -1, 0], [-1, 2, -1], [0, -1, 2]];
+//! let e = try linalg::eigh(k);
+//! println(f"squared frequencies {e.values():.4}");
+//! println(f"frequencies {e.values().map(|v: f64| -> f64 { v.sqrt() }):.4}");
+//! # // 2 - sqrt(2), 2, 2 + sqrt(2)
+//! # assert((e.values()[0] - 0.5857864376269049).abs() < 1e-12);
+//! # assert((e.values()[2] - 3.414213562373095).abs() < 1e-12);
+//! ```
+//!
+//! ```text
+//! squared frequencies [0.5858, 2.0000, 3.4142]
+//! frequencies [0.7654, 1.4142, 1.8478]
+//! ```
+//!
+//! The singular value decomposition works on any matrix. Its singular
+//! values show the rank and how well conditioned a matrix is: the ratio of
+//! the largest to the smallest is the condition number, and `linalg::cond`
+//! computes it.
+//!
+//! ```nabi
+//! use core::array::Matrix;
+//!
+//! let m: Matrix<f64> = [[1, 2], [2, 4.001]];
+//! let s = try linalg::svd(m);
+//! println(f"singular values {s.s():.5}");
+//! println(f"condition number {(try linalg::cond(m)):.0}");
+//! # assert(((try linalg::cond(m)) - 25008.0).abs() < 0.5);
+//! ```
+//!
+//! ```text
+//! singular values [5.00080, 0.00020]
+//! condition number 25008
+//! ```
+//!
+//! A condition number of about 2.5 x 10<sup>4</sup> means a solve can lose
+//! more than four of the sixteen digits a `f64` carries: the two rows are
+//! almost the same equation.
+//!
+//! ### What next
+//!
+//! - [`sparse`](https://packages.nabi-lang.org/docs/sparse/latest): the
+//!   same work for large matrices that are mostly zeros, with iterative and
+//!   direct solvers.
+//! - [`stats`](https://packages.nabi-lang.org/docs/stats/latest):
+//!   distributions, tests and regression.
+//! - The rest of this package: QR, Schur, `expm`, matrix functions.
+//!
 
 pub mod factor;
 #[cfg(feature = "ops")]
