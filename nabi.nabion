@@ -1,6 +1,6 @@
 Package {
     name: "linalg",
-    version: "0.1.0",
+    version: "0.1.1",
     nabi_version: "0.1.0",
     toolchain: "0.1",
     description: "Dense linear algebra on core arrays: products, LU, Cholesky, QR, SVD, eigen, Schur, solvers, expm",
