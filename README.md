@@ -162,7 +162,7 @@ blocked updates.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/linalg/latest/docs
+https://docs.nabi-lang.org/packages/linalg/latest
 
 ## License
 
